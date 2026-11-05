@@ -877,6 +877,14 @@ function renderSettings() {
     <label class="field"><span>週一到週五提醒</span><input id="remOn" type="checkbox" ${s.reminder.on ? 'checked' : ''}></label>
     <label class="field"><span>時間</span><input id="remTime" type="time" value="${pad2(s.reminder.h)}:${pad2(s.reminder.m)}"></label>
     <button class="btn wide" data-act="saveRem">儲存</button></section>` : ''}
+  ${(() => {
+    const v = otaInfo();
+    if (!v) return '';
+    return `<section class="card"><h3 class="sec0">App 版本與更新</h3>
+      <p class="small">主程式 ${esc(v.nativeVersion)}<br>畫面與功能 ${esc(v.webVersion)}（${v.webSource === 'ota' ? '已透過 OTA 更新' : 'APK 內建'}）</p>
+      <button class="btn wide" data-act="otaCheck">檢查更新</button>
+      <p class="muted small">${v.configured ? '每次打開 App 會自動檢查。畫面和功能的更新不用重新安裝；主程式更新需要在系統的安裝畫面按確認。' : '這個 APK 建置時還沒有設定網站，沒有 OTA 更新功能。'}</p></section>`;
+  })()}
   ${IS_WEB && !isStandalone() ? `<section class="card warn"><b>建議加到主畫面</b><p class="small">在 Safari 按下方「分享」→「加入主畫面」，之後從主畫面圖示打開。
     直接在 Safari 裡使用的話，太久沒開時 Safari 可能會清掉這個網站的資料（包括我的帳戶），加到主畫面就不會。</p></section>` : ''}
 
@@ -1120,6 +1128,9 @@ document.addEventListener('click', e => {
       break;
     }
     case 'export': exportStatement(); break;
+    case 'otaCheck': if (Native && Native.checkUpdate) { Native.checkUpdate(); toast('檢查更新中…'); } break;
+    case 'otaApply': if (Native && Native.applyWebUpdate) Native.applyWebUpdate(); break;
+    case 'otaInstall': if (Native && Native.installApk) Native.installApk(); break;
     case 'exportBackup': exportBackup(); break;
     case 'importBackup': openImport(); break;
     case 'saveSim': {
@@ -1212,6 +1223,24 @@ function openImport() {
     if (f) f.text().then(t => { $('#fText').value = t; });
   });
 }
+// ============================================================ Android OTA 更新
+// 原生端啟動時自動檢查；網頁更新下載完就顯示「立即套用」，APK 更新則提示下載安裝（系統會再問一次）
+const otaInfo = () => { try { return Native && Native.getVersionInfo ? JSON.parse(Native.getVersionInfo()) : null; } catch (e) { return null; } };
+function otaBanner(text, act, label) {
+  const el = $('#ota');
+  el.innerHTML = `<span>${esc(text)}</span>${act ? `<button data-act="${act}">${label}</button>` : ''}`;
+  el.classList.remove('hidden');
+}
+window.__otaEvent = ev => {
+  if (ev.type === 'web-ready') otaBanner('新版本已下載完成', 'otaApply', '立即套用');
+  else if (ev.type === 'apk-available') otaBanner(`App 主程式有新版 ${ev.versionName}${ev.notes ? '：' + ev.notes : ''}`, 'otaInstall', '下載安裝');
+  else if (ev.type === 'apk-downloading') otaBanner('正在下載新版 App，完成後會出現安裝畫面…');
+  else if (ev.type === 'need-permission') toast('請在設定裡允許「安裝不明應用程式」，回來後再按一次下載安裝');
+  else if (ev.type === 'none' && ev.manual) toast('已經是最新版本');
+  else if (ev.type === 'error' && ev.manual) toast(ev.msg);
+  if (App.tab === 'settings' && ev.manual) render();
+};
+
 const isStandalone = () => window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
 
 // ============================================================ 啟動
@@ -1229,6 +1258,7 @@ async function boot() {
   computeSim();
   runDCA();
   render();
+  if (Native && Native.bootOk) Native.bootOk();   // 告訴 OTA 這個版本能正常開機
   if (Native && Native.setReminder) Native.setReminder(App.settings.reminder.h, App.settings.reminder.m, App.settings.reminder.on);
   const last = App.dates[App.dates.length - 1];
   if ((Native || IS_WEB) && (!last || last < lastExpectedTradingDay())) syncData();
