@@ -3,6 +3,7 @@
     "versionName":  "1.20261105.1805",
     "webVersion":  "20261105100515",
     "sha256":  "351f9702e0bbf4b195ac68cba651c2b7a5eed49dec8bfd9905fab688a23088e2",
-    "notes":  "加入 OTA 自動更新",
-    "built":  "2026-11-05 18:05"
+    "notes":  "åŠ å…¥ OTA è‡ªå‹•æ›´æ–°",
+    "built":  "2026-11-05 18:05",
+    "nativeHash":  "238d0972c7774b7cb3c2f711ff5fe3d81c107130966259873b60e84745df3026"
 }
