@@ -81,6 +81,7 @@ details[open].card > summary { margin-bottom: 8px; }
 .side { font-size: 12px; padding: 1px 6px; border-radius: 6px; background: var(--na-bg); }
 .side.buy { background: var(--bull-bg); color: var(--up); }
 .side.sell { background: var(--bear-bg); color: var(--down); }
+.side.div { background: var(--flat-bg); color: var(--c3); }
 
 .tbl { width: 100%; border-collapse: collapse; font-size: 14px; }
 .tbl th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 0; border-bottom: 1px solid var(--line); }
@@ -90,10 +91,10 @@ details[open].card > summary { margin-bottom: 8px; }
 .num { font-variant-numeric: tabular-nums; }
 
 .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; margin-top: 14px; }
-.actions { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 16px; }
+.actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
 .act { border: 0; background: var(--bg); border-radius: 12px; padding: 10px 0 8px; font-size: 12px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .act i { font-style: normal; font-weight: 700; font-size: 16px; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: var(--card); color: var(--accent); }
-.act.buy i { color: var(--up); } .act.sell i { color: var(--down); }
+.act.buy i { color: var(--up); } .act.sell i { color: var(--down); } .act.div i { color: var(--c3); }
 
 .txn { padding: 10px 0; border-top: 1px solid var(--line); }
 .txn:first-of-type { border-top: 0; }

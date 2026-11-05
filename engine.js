@@ -63,17 +63,45 @@ function parseFundCsv(text) {
   return { date, map };
 }
 
+// 每股配股小於這個值視為沒有配股（參考價四捨五入到 0.01 造成的誤差；真的配股至少每千股 1 股）
+const STOCK_DIV_MIN = 0.0005;
+
+// 二代健保補充保費：單次股利 2 萬元以上扣 2.11%；匯費每次 10 元
+function dividendNet(gross) {
+  if (gross <= 0) return { gross: 0, nhi: 0, remit: 0, net: 0 };
+  const nhi = gross >= 20000 ? Math.round(gross * 0.0211) : 0, remit = 10;
+  return { gross, nhi, remit, net: Math.max(0, gross - nhi - remit) };
+}
+
 // 從 startIdx 開始逐日跑紙上交易與 100 萬模擬帳戶。fundAt(date) 回傳當天可用的基本面快照。
-function runStrategy(days, fundAt, startIdx, cfgIn, names) {
+// divs：{ 除權息日: { code: { prev, ref, cash, stock } } }，prev/ref 是除權息前收盤與參考價，cash 每股現金股利，stock 每股配股。
+function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
   const cfg = Object.assign({}, DEFAULT_CFG, cfgIn || {});
   const G = {};
   for (const k of GROUPS) {
     G[k] = { key: k, w: k === 'Core' ? 1 / cfg.coreCap : 1 / 30, navG: 1, navN: 1, pos: [], pendBuy: [], pendSell: [], closed: [], closedN: 0, closedSum: 0 };
   }
-  const acct = { cash: cfg.capital, fees: 0, hold: [], trades: [] };
+  const acct = { cash: cfg.capital, fees: 0, divs: 0, hold: [], trades: [] };
   const perf = [], log = [];
   let fund = {}, cache = new Map();
   const nm = c => (names && names[c]) || c;
+
+  // 除權息事件：還原係數 f = 參考價 / 除權息前收盤（< 1）。事件日之前的價格乘上 f 就是「還原權息」價格，
+  // 指標都用還原價計算，避免除息缺口被誤判成跌破均線或停損
+  const ev = Object.create(null), evDay = [];
+  days.forEach((d, i) => {
+    const m = divs && divs[d.date];
+    evDay[i] = m || null;
+    if (m) for (const c in m) if (m[c].prev > 0 && m[c].ref > 0) (ev[c] || (ev[c] = [])).push({ i, f: m[c].ref / m[c].prev });
+  });
+  const adjF = (c, i, t) => {
+    const E = ev[c];
+    if (!E) return 1;
+    let f = 1;
+    for (const e of E) if (e.i > i && e.i <= t) f *= e.f;
+    return f;
+  };
+  const evOn = (t, c) => { const m = evDay[t]; return m && m[c] && m[c].prev > 0 && m[c].ref > 0 ? m[c] : null; };
 
   const Q = (t, c) => (t < 0 ? null : days[t].q[c] || null);
   const cl = (t, c) => { const q = Q(t, c); return q ? q[3] : null; };
@@ -83,7 +111,7 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
     let res = null;
     if (t - n + 1 >= 0) {
       let s = 0, k = 0;
-      for (let i = t - n + 1; i <= t; i++) { const q = days[i].q[c]; if (q) { s += q[3]; k++; } }
+      for (let i = t - n + 1; i <= t; i++) { const q = days[i].q[c]; if (q) { s += q[3] * adjF(c, i, t); k++; } }
       if (k >= Math.ceil(n * 0.8)) res = s / k;
     }
     cache.set(key, res);
@@ -98,11 +126,14 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
     let s = 0, k = 0;
     for (let i = Math.max(1, t - 13); i <= t; i++) {
       const q = days[i].q[c], p = days[i - 1].q[c];
-      if (q && p) { s += Math.max(q[1] - q[2], Math.abs(q[1] - p[3]), Math.abs(q[2] - p[3])); k++; }
+      if (q && p) {
+        const fq = adjF(c, i, t), pc = p[3] * adjF(c, i - 1, t);
+        s += Math.max((q[1] - q[2]) * fq, Math.abs(q[1] * fq - pc), Math.abs(q[2] * fq - pc)); k++;
+      }
     }
     return k ? s / k : null;
   }
-  const ret = (t, c, n) => { const a = cl(t, c), b = cl(t - n, c); return a && b ? a / b - 1 : null; };
+  const ret = (t, c, n) => { const a = cl(t, c), b = cl(t - n, c); return a && b ? a / (b * adjF(c, t - n, t)) - 1 : null; };
   function idxMA(t, n) {
     if (t - n + 1 < 0) return null;
     let s = 0;
@@ -211,9 +242,11 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
     return res.sort((a, b) => a.r20 - b.r20).slice(0, 5);
   }
 
+  // 紙上持股的含息報酬：mult 是除權息後「股利再投入」的累積倍數
+  const posRet = (p, price) => (price ? price * p.mult / p.entryPrice - 1 : null);
   function addSell(g, p, why, price) {
     if (g.pendSell.some(s => s.code === p.code)) return;
-    g.pendSell.push({ code: p.code, why, ret: price ? price / p.entryPrice - 1 : null, entryPrice: p.entryPrice, close: price });
+    g.pendSell.push({ code: p.code, why, ret: posRet(p, price), entryPrice: p.entryPrice, close: price });
   }
   function addBuy(g, t, code, why) {
     g.pendBuy.push({ code, atr: atr(t, code), why, close: cl(t, code) });
@@ -223,6 +256,17 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
   // 模擬帳戶：昨天的決定今天成交；整張用開盤價、零股用收盤價 ±0.1%
   function execAccount(t) {
     const date = days[t].date;
+    // 除權息日：前一天收盤還持有的股票領股利（實際發放約一個月後，這裡簡化成除息日入帳）
+    for (const h of acct.hold) {
+      const e = evOn(t, h.code);
+      if (!e) continue;
+      const d = dividendNet(Math.floor(h.shares * e.cash)), add = Math.floor(h.shares * e.stock);
+      if (!d.net && !add) continue;
+      acct.cash += d.net; acct.divs += d.net; h.shares += add;
+      acct.trades.push({ date, group: h.group, code: h.code, name: nm(h.code), side: '股利', shares: add, price: e.cash,
+        amount: d.gross, fee: d.nhi + d.remit, tax: 0, pnl: null,
+        why: `現金股利每股 ${e.cash.toFixed(2)} 元` + (add ? `、配股 ${add} 股` : '') + (d.nhi ? `（已扣二代健保 ${d.nhi}）` : '') });
+    }
     for (const gk of GROUPS) {
       for (const s of G[gk].pendSell) {
         const key = gk + '|' + s.code, h = acct.hold.find(x => x.key === key), q = Q(t, s.code);
@@ -265,15 +309,20 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
     const date = days[t].date, w = g.w;
     let r = 0, cost = 0;
     const carry = [];
+    // 除權息日：前一天收盤持有的部位（含今天開盤要賣的）領股利；報酬用還原價計算，停損價跟著還原
+    for (const p of g.pos) {
+      const e = evOn(t, p.code);
+      if (e) { p.exF = e.ref / e.prev; p.mult /= p.exF; p.stop = Math.round(p.stop * p.exF * 100) / 100; } else p.exF = 1;
+    }
     for (const s of g.pendSell) {
       const p = g.pos.find(x => x.code === s.code);
       if (!p) continue;
       const q = Q(t, s.code);
       if (!q || q[0] <= 0) { carry.push(s); continue; }   // 沒成交就明天再賣
       const pc = cl(t - 1, s.code);
-      if (pc) r += w * (q[0] / pc - 1);
+      if (pc) r += w * (q[0] / (pc * p.exF) - 1);
       cost += w * (cfg.fee + cfg.tax + cfg.slip);
-      const rr = q[0] / p.entryPrice - 1;
+      const rr = posRet(p, q[0]);
       g.closed.push({ code: p.code, entryDate: p.entryDate, entryPrice: p.entryPrice, exitDate: date, exitPrice: q[0], ret: rr, why: s.why });
       if (g.closed.length > 200) g.closed.shift();
       g.closedN++; g.closedSum += rr;
@@ -281,14 +330,14 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
     }
     for (const p of g.pos) {
       const c1 = cl(t, p.code), c0 = cl(t - 1, p.code);
-      if (c1 && c0) r += w * (c1 / c0 - 1);
+      if (c1 && c0) r += w * (c1 / (c0 * p.exF) - 1);
       if (c1) p.last = c1;
     }
     for (const b of g.pendBuy) {
       const q = Q(t, b.code);
       if (!q || q[0] <= 0) continue;
       const a = b.atr || q[0] * 0.05;
-      g.pos.push({ code: b.code, entryDate: date, entryPrice: q[0], stop: Math.round((q[0] - cfg.atrMult * a) * 100) / 100, last: q[3], below: 0 });
+      g.pos.push({ code: b.code, entryDate: date, entryPrice: q[0], stop: Math.round((q[0] - cfg.atrMult * a) * 100) / 100, last: q[3], below: 0, mult: 1, exF: 1 });
       r += w * (q[3] / q[0] - 1); cost += w * (cfg.fee + cfg.slip);
     }
     g.pendSell = carry; g.pendBuy = [];
@@ -374,7 +423,7 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names) {
 
   let last = null;
   for (let t = startIdx; t < days.length; t++) last = runDay(t);
-  return { cfg, G, acct, perf, log, last };
+  return { cfg, G, acct, perf, log, last, posRet };
 }
 
 function perfSummary(perf) {

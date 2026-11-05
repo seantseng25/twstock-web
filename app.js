@@ -92,10 +92,11 @@ const nm = c => App.names[c] || c;
 // ============================================================ 狀態
 const App = {
   tab: 'suggest', names: {}, days: [], dates: [], funds: [], sim: null, viewDate: null,
+  divs: {}, divList: [], divNext: [],
   settings: null, my: null, busy: false, charts: {}, sheet: null, stmtMonth: 'all',
 };
 const SETTINGS_DEFAULT = { startDate: null, capital: 1000000, exitDays: 1, reminder: { on: true, h: 17, m: 30 } };
-const MY_DEFAULT = { seq: 0, txns: [], plans: [], fee: { discount: 1, minFee: 20, minFeeOdd: 1, dcaFee: 1 } };
+const MY_DEFAULT = { seq: 0, txns: [], plans: [], dismissed: [], fee: { discount: 1, minFee: 20, minFeeOdd: 1, dcaFee: 1 } };
 
 function loadJson(name, def) {
   try { const s = Store.read(name); if (s) return Object.assign(JSON.parse(JSON.stringify(def)), JSON.parse(s)); } catch (e) { /* 壞檔就用預設值 */ }
@@ -118,6 +119,69 @@ function loadData() {
   App.dates = listByPrefix('d_');
   App.days = App.dates.map(d => parseDayCsv(d, readCsv('d_', d), App.names));
   App.funds = listByPrefix('f_').map(d => Object.assign(parseFundCsv(readCsv('f_', d)), { date: d }));
+  loadDivs();
+  try { App.bt = JSON.parse(Store.read('backtest.json') ?? Store.asset('seed/backtest.json') ?? 'null'); } catch (e) { App.bt = null; }
+}
+
+// 除權息：div.csv（Date,Code,Prev,Ref,Cash,Stock）＝已發生的；div_next.json＝證交所預告
+function loadDivs() {
+  App.divs = {}; App.divList = [];
+  const text = Store.read('div.csv') ?? Store.asset('seed/div.csv');
+  if (text) {
+    for (const ln of text.split(/\r?\n/).slice(1)) {
+      const p = ln.split(',');
+      if (p.length < 6) continue;
+      const e = { date: p[0], code: p[1], prev: +p[2], ref: +p[3], cash: +p[4], stock: +p[5] < STOCK_DIV_MIN ? 0 : +p[5] };
+      (App.divs[e.date] || (App.divs[e.date] = {}))[e.code] = e;
+      App.divList.push(e);
+    }
+    App.divList.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  }
+  try { App.divNext = JSON.parse(Store.read('div_next.json') || '[]'); } catch (e) { App.divNext = []; }
+}
+const rocDate = s => { const m = /(\d+)年(\d+)月(\d+)日/.exec(String(s)); return m ? `${+m[1] + 1911}-${pad2(+m[2])}-${pad2(+m[3])}` : null; };
+
+// 證交所除權除息計算結果表 → 每股現金股利與配股
+function parseExRight(r) {
+  const date = rocDate(r[0]), code = String(r[1]).trim(), P = num(r[3]), R = num(r[4]), V = num(r[5]), type = String(r[6]).trim(), X = num(r[10]);
+  if (!date || !P || !R) return null;
+  // 息：現金股利＝權值+息值；權息：現金股利＝前收盤−減除股利參考價；權：沒有現金股利。其餘差額換算成每股配股
+  let cash = 0;
+  if (type === '息') cash = V; else if (type === '權息' && X) cash = P - X;
+  let stock = (P - cash) / R - 1;
+  if (stock < STOCK_DIV_MIN) stock = 0;
+  return { date, code, prev: P, ref: R, cash: +cash.toFixed(6), stock: +stock.toFixed(6) };
+}
+
+async function syncDividends() {
+  const today = ymd(new Date()), first = App.dates[0];
+  if (!first) return;
+  const have = App.divList, spans = [];
+  if (!have.length) spans.push([first, today]);
+  else {
+    if (first < have[0].date) spans.push([first, addDays(have[0].date, -1)]);
+    spans.push([addDays(have[have.length - 1].date, -10), today]);
+  }
+  const map = {};
+  for (const e of have) map[e.date + '|' + e.code] = e;
+  for (const [from, to] of spans) {
+    for (let s = from; s <= to; s = addDays(s, 365)) {
+      const e = addDays(s, 364) < to ? addDays(s, 364) : to;
+      setStatus(`下載除權息資料（${s.slice(0, 4)}）…`, 0.9);
+      const j = await fetchJson(`https://www.twse.com.tw/rwd/zh/exRight/TWT49U?startDate=${s.replace(/-/g, '')}&endDate=${e.replace(/-/g, '')}&response=json`);
+      if (j.stat === 'OK') for (const r of j.data) { const x = parseExRight(r); if (x) map[x.date + '|' + x.code] = x; }
+      await sleep(2500);
+    }
+  }
+  const rows = Object.values(map).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.code < b.code ? -1 : 1));
+  Store.write('div.csv', ['Date,Code,Prev,Ref,Cash,Stock'].concat(rows.map(e => [e.date, e.code, e.prev, e.ref, e.cash, e.stock].join(','))).join('\n'));
+  // 預告表：還沒發生的除權息，「待公告」的現金股利記成 null
+  const k = await fetchJson('https://www.twse.com.tw/rwd/zh/exRight/TWT48U?response=json');
+  if (k.stat === 'OK') {
+    Store.write('div_next.json', JSON.stringify(k.data.map(r => ({ date: rocDate(r[0]), code: String(r[1]).trim(), cash: num(r[7]), stock: num(r[4]) || 0 }))
+      .filter(x => x.date)));
+  }
+  loadDivs();
 }
 function fundAt(date) {
   let r = App.funds[0];
@@ -141,7 +205,7 @@ function computeSim() {
   let start = 60;
   if (App.settings.startDate) { const i = App.dates.findIndex(d => d >= App.settings.startDate); if (i >= 0) start = Math.max(60, i); }
   start = Math.min(start, n - 1);
-  App.sim = runStrategy(App.days, fundAt, start, { capital: App.settings.capital, exitDays: App.settings.exitDays }, App.names);
+  App.sim = runStrategy(App.days, fundAt, start, { capital: App.settings.capital, exitDays: App.settings.exitDays }, App.names, App.divs);
 }
 
 // ---------------------------------------------------------- 下載（臺灣證券交易所）
@@ -236,10 +300,14 @@ async function mergeServerData() {
   let idx;
   try { idx = JSON.parse(await httpGet('data/index.json?t=' + Date.now())); } catch (e) { return 0; }
   const missing = (idx.files || []).filter(f => /^[df]_\d{4}-\d{2}-\d{2}\.csv$/.test(f) && Store.read(f) == null);
+  if ((idx.files || []).includes('div.csv') && Store.read('div.csv') == null) missing.push('div.csv');
+  const btVer = String(idx.backtest || '');
+  if ((idx.files || []).includes('backtest.json') && Store.read('backtest_ver.txt') !== btVer) missing.push('backtest.json');
   for (let i = 0; i < missing.length; i += 6) {
     setStatus(`從網站同步資料（${i}/${missing.length}）…`, i / missing.length);
     await Promise.all(missing.slice(i, i + 6).map(async f => { Store.write(f, await httpGet('data/' + f)); }));
   }
+  if (missing.includes('backtest.json')) Store.write('backtest_ver.txt', btVer);
   return missing.length;
 }
 
@@ -279,6 +347,7 @@ async function syncData(opts = {}) {
       setStatus('更新基本面資料…', k / total);
       try { await syncFund(today); loadData(); } catch (e) { toast('基本面更新失敗，沿用舊資料'); }
     }
+    try { await syncDividends(); } catch (e) { toast('除權息資料更新失敗，沿用舊資料'); }
     computeSim();
     const ran = runDCA();
     toast(todo.length ? `更新完成，最新資料 ${App.dates[App.dates.length - 1]}` + (ran ? `，定期定額成交 ${ran} 筆` : '') : '已是最新資料');
@@ -292,7 +361,7 @@ async function syncData(opts = {}) {
 }
 
 // ============================================================ 我的帳戶
-const TXN_LABEL = { DEPOSIT: '入金', WITHDRAW: '出金', BUY: '買進', SELL: '賣出', DCA: '定期定額', DCA_FAIL: '定期定額失敗' };
+const TXN_LABEL = { DEPOSIT: '入金', WITHDRAW: '出金', BUY: '買進', SELL: '賣出', DCA: '定期定額', DCA_FAIL: '定期定額失敗', DIV: '股利' };
 
 function myFee(amount, shares, dca) {
   const f = App.my.fee;
@@ -310,12 +379,16 @@ const sortTxns = txns => txns.slice().sort((a, b) => (a.date < b.date ? -1 : a.d
 
 // 依序重播所有交易，算出現金、持股（平均成本法）、已實現損益；錯誤（現金或持股變負）丟例外
 function replay(txns) {
-  const st = { cash: 0, net: 0, hold: {}, realized: 0, fees: 0, taxes: 0, lastPx: {}, rows: [] };
+  const st = { cash: 0, net: 0, hold: {}, realized: 0, fees: 0, taxes: 0, divIncome: 0, lastPx: {}, rows: [] };
   for (const t of sortTxns(txns)) {
     const h = t.code ? (st.hold[t.code] || (st.hold[t.code] = { shares: 0, cost: 0 })) : null;
     let pnl = null;
     if (t.type === 'DEPOSIT') { st.cash += t.amount; st.net += t.amount; }
     else if (t.type === 'WITHDRAW') { st.cash -= t.amount; st.net -= t.amount; }
+    else if (t.type === 'DIV') {
+      // 現金股利扣掉二代健保和匯費入帳；配股增加股數、總成本不變（平均成本下降）
+      st.cash += t.amount - t.fee; st.divIncome += t.amount - t.fee; h.shares += t.shares || 0;
+    }
     else if (t.type === 'BUY' || t.type === 'DCA') {
       st.cash -= t.amount + t.fee; h.shares += t.shares; h.cost += t.amount + t.fee; st.fees += t.fee; st.lastPx[t.code] = t.price;
     } else if (t.type === 'SELL') {
@@ -334,7 +407,7 @@ function replay(txns) {
 
 function myState() {
   let st;
-  try { st = replay(App.my.txns); } catch (e) { st = { cash: 0, net: 0, hold: {}, realized: 0, fees: 0, taxes: 0, lastPx: {}, rows: [], error: e.message }; }
+  try { st = replay(App.my.txns); } catch (e) { st = { cash: 0, net: 0, hold: {}, realized: 0, fees: 0, taxes: 0, divIncome: 0, lastPx: {}, rows: [], error: e.message }; }
   const lastDate = App.dates[App.dates.length - 1];
   let mv = 0, mvPrev = 0, cost = 0;
   const list = [];
@@ -417,6 +490,7 @@ function myHistory() {
       else if (t.type === 'WITHDRAW') { st.cash -= t.amount; st.net -= t.amount; }
       else if (t.type === 'BUY' || t.type === 'DCA') { st.cash -= t.amount + t.fee; h.shares += t.shares; h.px = t.price; }
       else if (t.type === 'SELL') { st.cash += t.amount - t.fee - t.tax; h.shares -= t.shares; h.px = t.price; }
+      else if (t.type === 'DIV') { st.cash += t.amount - t.fee; h.shares += t.shares || 0; }
     }
     let mv = 0;
     for (const c in st.hold) { const h = st.hold[c]; if (!h.shares) continue; const q = App.days[i].q[c]; if (q) h.px = q[3]; mv += h.shares * h.px; }
@@ -536,7 +610,7 @@ function regimeText(n, L) {
 function groupHoldings(g) {
   const G = App.sim.G[g], t = App.days.length - 1, today = parseYmd(App.dates[t]);
   const rows = G.pos.slice().sort((a, b) => (a.entryDate < b.entryDate ? -1 : 1)).map(p => {
-    const cur = App.days[t].q[p.code]?.[3] ?? p.last, r = cur / p.entryPrice - 1;
+    const cur = App.days[t].q[p.code]?.[3] ?? p.last, r = App.sim.posRet(p, cur);
     const days = Math.round((today - parseYmd(p.entryDate)) / 86400000);
     return `<tr><td>${stockLine(p.code)}<div class="muted small">${p.entryDate}・${days} 天</div></td>
       <td class="num">${px(p.entryPrice)}<div class="muted small">停損 ${px(p.stop)}</div></td>
@@ -549,9 +623,44 @@ function groupHoldings(g) {
 }
 
 // ---------------------------------------------------------- 百萬模擬
+// 長期回測：電腦用完整歷史（2004 年起）跑同一套策略，手機只顯示結果
+function renderLongBacktest() {
+  const bt = App.bt;
+  if (!bt || !bt.runs || !bt.runs.length) return '';
+  const k = Math.min(App.btRun || 0, bt.runs.length - 1), R = bt.runs[k], S = R.series, i0 = S.index[0];
+  App.charts.long = { labels: S.dates, pct: true, series: [
+    { name: '模擬帳戶', color: 'var(--accent)', data: S.acct.map(v => v / R.capital - 1) },
+    { name: '加權指數（不含息）', color: 'var(--muted)', data: S.index.map(v => v / i0 - 1), dash: true },
+  ] };
+  const pick = bt.runs.length > 1 ? `<select data-change="btRun">${bt.runs.map((r, i) => `<option value="${i}" ${i === k ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select>` : `<p class="small">${esc(R.label)}</p>`;
+  const yrows = R.yearly.slice().reverse().map(y => `<tr><td>${y.year}</td><td class="num ${ud(y.acct)}">${fmtPct(y.acct, 1)}</td><td class="num ${ud(y.index)}">${fmtPct(y.index, 1)}</td>
+    <td class="num ${ud(y.Core)}">${fmtPct(y.Core, 1)}</td><td class="num ${ud(y.Value)}">${fmtPct(y.Value, 1)}</td><td class="num ${ud(y.Pead)}">${fmtPct(y.Pead, 1)}</td></tr>`).join('');
+  const crows = R.crises.map(c => `<tr><td>${esc(c.name)}<div class="muted small">${c.from} ~ ${c.to}</div></td>
+    <td class="num ${ud(c.acct)}">${fmtPct(c.acct, 1)}</td><td class="num ${ud(c.index)}">${fmtPct(c.index, 1)}</td></tr>`).join('');
+  return `<section class="card"><h3 class="sec0">長期回測（${R.start.slice(0, 4)} ~ ${R.end.slice(0, 4)}）</h3>${pick}
+    <div class="muted small" style="margin-top:8px">100 萬照策略自動買賣 ${R.days.toLocaleString()} 個交易日</div>
+    <div class="hero ${ud(R.acctRet)}">${money(R.final)}</div>
+    <div class="${ud(R.acctRet)}">總報酬 ${fmtPct(R.acctRet, 1)}・年化 ${fmtPct(R.cagr)}<span class="muted">　大盤年化 ${fmtPct(R.idxCagr)}</span></div>
+    <div class="grid3">
+      <div><div class="muted small">最大回落</div><b>${(R.acctMdd * 100).toFixed(1)}%</b></div>
+      <div><div class="muted small">股利收入</div><b>${money(R.divs)}</b></div>
+      <div><div class="muted small">手續費+稅</div><b>${money(R.fees)}</b></div>
+      <div><div class="muted small">賣出筆數</div><b>${R.trades.toLocaleString()}</b></div>
+      <div><div class="muted small">勝率</div><b>${R.winRate != null ? (R.winRate * 100).toFixed(1) + '%' : '—'}</b></div>
+      <div><div class="muted small">三組合計</div><b class="${ud(R.combRet)}">${fmtPct(R.combRet, 0)}</b></div>
+    </div></section>
+  <section class="card">${chartBlock('long')}</section>
+  ${crows ? `<section class="card"><h3 class="sec0">股災和大多頭時的表現</h3><table class="tbl"><thead><tr><th>期間</th><th class="num">帳戶</th><th class="num">大盤</th></tr></thead><tbody>${crows}</tbody></table></section>` : ''}
+  <details class="card"><summary>逐年報酬</summary><table class="tbl"><thead><tr><th>年</th><th class="num">帳戶</th><th class="num">大盤</th><th class="num">核心</th><th class="num">價值</th><th class="num">PEAD</th></tr></thead><tbody>${yrows}</tbody></table>
+    <p class="muted small">核心組、PEAD 組要有月營收資料（2010 年起）才會選股。</p></details>
+  <p class="muted small">長期回測由電腦用證交所 ${bt.dataFrom} 起的完整歷史計算，選股只用當時已公布的營收和淨值比；大盤用不含息的加權指數。過去績效不代表未來。</p>
+  <h3 class="sec">近期模擬（手機計算）</h3>`;
+}
+
 function renderSim() {
   const sim = App.sim;
-  if (!sim || !sim.perf.length) return empty('還沒有足夠的資料。');
+  const long = renderLongBacktest();
+  if (!sim || !sim.perf.length) return long + empty('還沒有足夠的資料。');
   const s = perfSummary(sim.perf), cap = sim.cfg.capital, a = sim.last.acct, pnl = a.total - cap;
   App.charts.sim = {
     labels: sim.perf.map(x => x.date), pct: true,
@@ -561,7 +670,7 @@ function renderSim() {
       { name: '大盤', color: 'var(--muted)', data: sim.perf.map(x => x.index / sim.perf[0].index - 1), dash: true },
     ],
   };
-  let h = `<section class="card">
+  let h = long + `<section class="card">
     <div class="muted">帳戶總值（本金 ${money(cap)}）</div>
     <div class="hero ${ud(pnl)}">${money(a.total)}</div>
     <div class="${ud(pnl)}">${signMoney(pnl)}（${fmtPct(pnl / cap)}）<span class="muted">　同期大盤 ${fmtPct(s.idx)}</span></div>
@@ -570,10 +679,11 @@ function renderSim() {
       <div><div class="muted small">股票</div><b>${money(a.stock)}</b></div>
       <div><div class="muted small">手續費+稅</div><b>${money(sim.acct.fees)}</b></div>
       <div><div class="muted small">最大回落</div><b>${(s.acctMdd * 100).toFixed(2)}%</b></div>
-      <div><div class="muted small">交易日數</div><b>${s.n}</b></div>
+      <div><div class="muted small">股利收入</div><b class="${ud(sim.acct.divs)}">${money(sim.acct.divs)}</b></div>
       <div><div class="muted small">起始日</div><b>${s.start}</b></div>
     </div>
-    <p class="muted small">每天收盤後照核心、價值、PEAD 三組訊號自動買賣，隔天成交：整張用開盤價、零股用收盤價＋0.1%，手續費和證交稅照扣，錢不夠就買不起。起始日可在「設定」修改。</p>
+    <p class="muted small">共 ${s.n} 個交易日。每天收盤後照核心、價值、PEAD 三組訊號自動買賣，隔天成交：整張用開盤價、零股用收盤價＋0.1%，手續費和證交稅照扣，錢不夠就買不起。
+      除權息日自動領股利（扣二代健保和匯費）。起始日可在「設定」修改。</p>
   </section>
   <section class="card">${chartBlock('sim')}</section>
   <section class="card"><h3 class="sec0">各組紙上成績</h3>
@@ -592,12 +702,16 @@ function renderSim() {
   h += `<section class="card"><h3 class="sec0">目前持股（${sim.acct.hold.length}）</h3>
     ${holds ? `<table class="tbl"><thead><tr><th>股票</th><th class="num">股數</th><th class="num">市值/損益</th></tr></thead><tbody>${holds}</tbody></table>` : empty('目前空手')}</section>`;
 
-  const trades = sim.acct.trades.slice(-100).reverse().map(x => `
-    <div class="txn"><div class="row between"><div>${stockLine(x.code, `<span class="side ${x.side === '買進' ? 'buy' : 'sell'}">${x.side}</span>`)}</div>
-      <div class="num">${x.side === '買進' ? '−' : '+'}${money(x.side === '買進' ? x.amount + x.fee : x.amount - x.fee - x.tax)}</div></div>
-      <div class="row between small muted"><span>${x.date}・${GROUP_LABEL[x.group]}・${x.shares.toLocaleString()} 股 @ ${px(x.price)}</span>
+  const trades = sim.acct.trades.slice(-100).reverse().map(x => {
+    const isDiv = x.side === '股利', buy = x.side === '買進';
+    const amt = buy ? -(x.amount + x.fee) : x.amount - x.fee - x.tax;
+    return `
+    <div class="txn"><div class="row between"><div>${stockLine(x.code, `<span class="side ${buy ? 'buy' : isDiv ? 'div' : 'sell'}">${x.side}</span>`)}</div>
+      <div class="num ${isDiv ? 'up' : ''}">${amt < 0 ? '−' : '+'}${money(Math.abs(amt))}</div></div>
+      <div class="row between small muted"><span>${x.date}・${GROUP_LABEL[x.group]}・${isDiv ? (x.shares ? `配股 ${x.shares.toLocaleString()} 股` : '現金股利') : `${x.shares.toLocaleString()} 股 @ ${px(x.price)}`}</span>
       ${x.pnl != null ? `<b class="${ud(x.pnl)}">${signMoney(x.pnl)}</b>` : ''}</div>
-      <div class="muted small">${esc(x.why)}</div></div>`).join('');
+      <div class="muted small">${esc(x.why)}</div></div>`;
+  }).join('');
   h += `<section class="card"><h3 class="sec0">交易紀錄（最近 100 筆）</h3>${trades || empty('還沒有交易')}</section>`;
   return h;
 }
@@ -625,16 +739,34 @@ function renderMine() {
       <div><div class="muted small">累計投入</div><b>${money(st.net)}</b></div>
       <div><div class="muted small">未實現</div><b class="${ud(st.unrealized)}">${signMoney(st.unrealized)}</b></div>
       <div><div class="muted small">已實現</div><b class="${ud(st.realized)}">${signMoney(st.realized)}</b></div>
-      <div><div class="muted small">手續費+稅</div><b>${money(st.fees + st.taxes)}</b></div>
+      <div><div class="muted small">股利收入</div><b class="${ud(st.divIncome)}">${signMoney(st.divIncome)}</b></div>
     </div>
+    <p class="muted small">手續費和證交稅累計 ${money(st.fees + st.taxes)} 元。總損益已包含股利。</p>
     <div class="actions">
       <button class="act" data-act="deposit"><i>＋</i>入金</button>
       <button class="act" data-act="withdraw"><i>－</i>出金</button>
       <button class="act buy" data-act="buy"><i>買</i>買進</button>
       <button class="act sell" data-act="sell"><i>賣</i>賣出</button>
       <button class="act" data-act="dca"><i>⟳</i>定期定額</button>
+      <button class="act div" data-act="dividend"><i>息</i>股利</button>
     </div>
   </section>`;
+
+  const pend = pendingDividends(), next = upcomingDividends(st.hold);
+  if (pend.length) {
+    h += `<section class="card"><h3 class="sec0">待確認股利（${pend.length}）</h3>${pend.map(p => `
+      <div class="txn"><div class="row between">${stockLine(p.code)}<b class="up">${p.net ? '+' + money(p.net) : ''}${p.stockShares ? `${p.net ? '・' : ''}配 ${p.stockShares} 股` : ''}</b></div>
+        <div class="small muted">除權息日 ${p.date}・當時持有 ${p.shares.toLocaleString()} 股・每股現金 ${p.cash.toFixed(2)}${p.stock ? `、配股 ${p.stock.toFixed(4)}` : ''}${p.nhi ? `・預扣二代健保 ${money(p.nhi)}` : ''}</div>
+        <div class="row between"><span class="muted small">股利通常在除息後約一個月入帳</span>
+        <span><button class="btn-sm" data-act="divConfirm" data-key="${p.divKey}">確認入帳</button> <button class="btn-sm ghost" data-act="divDismiss" data-key="${p.divKey}">忽略</button></span></div></div>`).join('')}
+      <p class="muted small">依證交所除權息資料和你在除權息前一天的持股自動算出；金額以實際入帳為準，確認時可以修改。</p></section>`;
+  }
+  if (next.length) {
+    h += `<section class="card"><h3 class="sec0">即將除權息</h3>${next.map(x => `
+      <div class="txn"><div class="row between">${stockLine(x.code)}<span class="small">${x.date}</span></div>
+        <div class="small muted">每股現金 ${x.cash != null ? x.cash.toFixed(4) : '待公告'}${x.stock ? `、配股 ${x.stock.toFixed(4)}` : ''}・持有 ${x.shares.toLocaleString()} 股${x.net ? `・預估入帳 ${money(x.net)}` : ''}</div></div>`).join('')}
+      <p class="muted small">除權息日前一天收盤還持有才領得到。</p></section>`;
+  }
   if (hist) h += `<section class="card">${chartBlock('mine')}</section>`;
 
   h += `<section class="card"><h3 class="sec0">持股（${st.list.length}）</h3>${st.list.length ? `<table class="tbl"><thead><tr><th>股票</th><th class="num">股數/均價</th><th class="num">市值/損益</th></tr></thead><tbody>${
@@ -665,15 +797,56 @@ function cashDelta(t) {
   if (t.type === 'WITHDRAW') return -t.amount;
   if (t.type === 'BUY' || t.type === 'DCA') return -(t.amount + t.fee);
   if (t.type === 'SELL') return t.amount - t.fee - t.tax;
+  if (t.type === 'DIV') return t.amount - t.fee;
   return 0;
+}
+
+// ---------------------------------------------------------- 股利：待確認（已除權息、當時有持股、還沒記錄）與即將除權息
+function sharesBefore(txns, code, date) {
+  let s = 0;
+  for (const t of txns) {
+    if (t.code !== code || t.date >= date) continue;
+    if (t.type === 'BUY' || t.type === 'DCA') s += t.shares;
+    else if (t.type === 'SELL') s -= t.shares;
+    else if (t.type === 'DIV') s += t.shares || 0;
+  }
+  return s;
+}
+function divEstimate(shares, cash, stock) {
+  const d = dividendNet(Math.floor(shares * (cash || 0)));
+  return Object.assign(d, { stockShares: Math.floor(shares * (stock || 0)) });
+}
+function pendingDividends() {
+  const txns = App.my.txns, codes = new Set(txns.filter(t => t.code).map(t => t.code));
+  if (!codes.size) return [];
+  const first = sortTxns(txns)[0].date;
+  // divKey＝「除權息日|代號」，把股利紀錄對應回除權息事件（事件本身的 ref 是參考價，不能拿來當鍵）
+  const done = new Set(txns.filter(t => t.type === 'DIV' && t.divKey).map(t => t.divKey)), skip = new Set(App.my.dismissed || []);
+  const out = [];
+  for (const e of App.divList) {
+    if (e.date <= first || !codes.has(e.code)) continue;
+    const divKey = e.date + '|' + e.code;
+    if (done.has(divKey) || skip.has(divKey)) continue;
+    const shares = sharesBefore(txns, e.code, e.date);
+    if (shares > 0) out.push(Object.assign({}, e, divEstimate(shares, e.cash, e.stock), { divKey, shares }));
+  }
+  return out.reverse();
+}
+function upcomingDividends(hold) {
+  const today = ymd(new Date());
+  return App.divNext.filter(x => x.date >= today && hold[x.code]).map(x => Object.assign({ shares: hold[x.code].shares }, x,
+    x.cash != null ? divEstimate(hold[x.code].shares, x.cash, x.stock) : {}));
 }
 function stmtRow(r) {
   const t = r.t, d = cashDelta(t), stock = t.code;
-  const cls = { BUY: 'buy', DCA: 'buy', SELL: 'sell' }[t.type] || '';
+  const cls = { BUY: 'buy', DCA: 'buy', SELL: 'sell', DIV: 'div' }[t.type] || '';
+  const detail = t.type === 'DIV'
+    ? `・現金 ${money(t.amount)}${t.shares ? `・配股 ${t.shares.toLocaleString()} 股` : ''}${t.fee ? `・健保+匯費 ${money(t.fee)}` : ''}`
+    : `${t.shares ? `・${t.shares.toLocaleString()} 股 @ ${px(t.price)}` : ''}${t.fee ? `・費 ${money(t.fee)}` : ''}${t.tax ? `・稅 ${money(t.tax)}` : ''}`;
   return `<div class="txn"><div class="row between">
       <div><span class="side ${cls}">${TXN_LABEL[t.type]}</span> ${stock ? `<span class="code">${esc(t.code)}</span> <b>${esc(nm(t.code))}</b>` : ''}</div>
       <div class="num ${d > 0 ? 'up' : d < 0 ? 'down' : ''}">${d ? signMoney(d) : '—'}</div></div>
-    <div class="row between small muted"><span>${t.date}${t.shares ? `・${t.shares.toLocaleString()} 股 @ ${px(t.price)}` : ''}${t.fee ? `・費 ${money(t.fee)}` : ''}${t.tax ? `・稅 ${money(t.tax)}` : ''}</span>
+    <div class="row between small muted"><span>${t.date}${detail}</span>
       <span>餘額 ${money(r.cash)}</span></div>
     ${r.pnl != null ? `<div class="small">已實現 <b class="${ud(r.pnl)}">${signMoney(r.pnl)}</b></div>` : ''}
     <div class="row between small muted"><span>${esc(t.note || '')}</span><button class="link" data-act="delTxn" data-id="${t.id}">刪除</button></div></div>`;
@@ -857,6 +1030,46 @@ function openTrade(side, code, price) {
   }));
 }
 
+// 記錄股利：從「待確認股利」帶入（pre）或手動輸入
+function openDividend(pre) {
+  pre = pre || {};
+  const exDate = pre.date || defaultDate();
+  openSheet('記錄股利', `
+    <label class="field"><span>股票代號</span><input id="fCode" list="stockList" inputmode="numeric" value="${pre.code || ''}" required></label>${stockDatalist()}
+    <div class="muted small" id="fName"></div>
+    <label class="field"><span>除權息日</span><input id="fEx" type="date" value="${exDate}" required></label>
+    <label class="field"><span>入帳日期</span><input id="fDate" type="date" value="${pre.date || defaultDate()}" required></label>
+    <label class="field"><span>當時持股</span><input id="fSh" type="number" inputmode="numeric" value="${pre.shares || ''}"></label>
+    <label class="field"><span>每股現金股利</span><input id="fCash" type="number" step="0.0001" inputmode="decimal" value="${pre.cash ?? ''}"></label>
+    <label class="field"><span>每股配股（股）</span><input id="fStock" type="number" step="0.0001" inputmode="decimal" value="${pre.stock || 0}"></label>
+    <label class="field"><span>二代健保</span><input id="fNhi" type="number" inputmode="numeric" placeholder="自動"></label>
+    <label class="field"><span>匯費</span><input id="fRemit" type="number" inputmode="numeric" value="10"></label>
+    <div class="calc" id="fCalc"></div>
+    <p class="muted small">二代健保：單次股利 2 萬元以上扣 2.11%（留空自動算）。配股不足 1 股的部分不計。</p>`, () => {
+    const c = fv('fCode'), sh = Math.floor(num(fv('fSh')) || 0), x = calc();
+    if (!c) throw new Error('請輸入股票代號');
+    if (!x.gross && !x.add) throw new Error('請輸入持股和每股股利');
+    addTxn({ date: fv('fDate'), type: 'DIV', code: c, shares: x.add, price: num(fv('fCash')) || 0, amount: x.gross, fee: x.nhi + x.remit, tax: 0,
+      divKey: pre.divKey || null, note: `除權息日 ${fv('fEx')}・持股 ${sh.toLocaleString()} 股` });
+    return `已記錄 ${nm(c)} 股利 ${money(x.gross - x.nhi - x.remit)} 元` + (x.add ? `、配股 ${x.add} 股` : '');
+  }, () => {
+    const c = fv('fCode');
+    $('#fName').textContent = c ? nm(c) : '';
+    if (!pre.shares && c && fv('fEx') && !fv('fSh')) {   // 手動輸入時自動帶入除權息前一天的持股
+      const s = sharesBefore(App.my.txns, c, fv('fEx'));
+      if (s > 0) $('#fSh').value = s;
+    }
+    const x = calc();
+    $('#fCalc').innerHTML = `現金股利 ${money(x.gross)}・二代健保 ${money(x.nhi)}・匯費 ${money(x.remit)}<br><b>實收 ${money(x.gross - x.nhi - x.remit)}</b>${x.add ? `　配股 <b>${x.add.toLocaleString()}</b> 股` : ''}`;
+  });
+  function calc() {
+    const sh = Math.floor(num(fv('fSh')) || 0), gross = Math.floor(sh * (num(fv('fCash')) || 0));
+    const nhiIn = num(fv('fNhi')), remit = gross > 0 ? Math.max(0, num(fv('fRemit')) ?? 10) : 0;
+    const nhi = nhiIn != null ? Math.max(0, nhiIn) : dividendNet(gross).nhi;
+    return { gross, nhi, remit, add: Math.floor(sh * (num(fv('fStock')) || 0)) };
+  }
+}
+
 function openDCA() {
   openSheet('新增定期定額', `
     <label class="field"><span>股票代號</span><input id="fCode" list="stockList" inputmode="numeric" placeholder="例如 0050" required></label>${stockDatalist()}
@@ -893,6 +1106,9 @@ document.addEventListener('click', e => {
     case 'buy': openTrade('BUY'); break;
     case 'sell': openTrade('SELL'); break;
     case 'dca': openDCA(); break;
+    case 'dividend': openDividend(); break;
+    case 'divConfirm': { const p = pendingDividends().find(x => x.divKey === el.dataset.key); if (p) openDividend(p); break; }
+    case 'divDismiss': (App.my.dismissed || (App.my.dismissed = [])).push(el.dataset.key); saveMy(); render(); toast('已忽略，之後不再提醒'); break;
     case 'quickBuy': { const p = priceOn(code, defaultDate()); openTrade('BUY', code, p && p.price); break; }
     case 'quickSell': openTrade('SELL', code); break;
     case 'togglePlan': { const p = App.my.plans.find(x => x.id === id); p.active = !p.active; saveMy(); if (p.active) runDCA(); render(); break; }
@@ -934,6 +1150,7 @@ document.addEventListener('change', e => {
   const k = e.target.dataset.change;
   if (k === 'pickDay') { App.viewDate = e.target.value; render(); }
   if (k === 'stmtMonth') { App.stmtMonth = e.target.value; render(); }
+  if (k === 'btRun') { App.btRun = +e.target.value; render(); }
 });
 document.addEventListener('input', e => { if (App.sheet && App.sheet.onInput && e.target.closest('#sheetForm')) App.sheet.onInput(); });
 document.addEventListener('submit', e => {
@@ -1015,6 +1232,9 @@ async function boot() {
   if (Native && Native.setReminder) Native.setReminder(App.settings.reminder.h, App.settings.reminder.m, App.settings.reminder.on);
   const last = App.dates[App.dates.length - 1];
   if ((Native || IS_WEB) && (!last || last < lastExpectedTradingDay())) syncData();
+  else if ((Native || IS_WEB) && !App.divList.length && last) {
+    syncDividends().then(() => { computeSim(); render(); }).catch(() => {}).finally(() => setStatus(null));
+  }
   if (IS_WEB && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
