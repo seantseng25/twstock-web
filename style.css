@@ -1,13 +1,13 @@
 :root {
   --bg: #f4f5f7; --card: #ffffff; --text: #16181d; --muted: #7a808c; --line: #e6e8ec;
-  --accent: #2f6fed; --c3: #c98a1b; --up: #e0393e; --down: #12a066; --warn: #b7791f;
+  --accent: #2f6fed; --c3: #c98a1b; --c4: #9b51c9; --up: #e0393e; --down: #12a066; --warn: #b7791f;
   --bull-bg: #fdecec; --bear-bg: #e7f6ef; --flat-bg: #fdf5e6; --na-bg: #eef0f3;
   --tab-h: 60px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0f1115; --card: #191c22; --text: #e8eaee; --muted: #8b919c; --line: #2a2e36;
-    --accent: #5b8cff; --c3: #e0a73a; --up: #ff5a5f; --down: #2cc483; --warn: #e5a93b;
+    --accent: #5b8cff; --c3: #e0a73a; --c4: #c084fc; --up: #ff5a5f; --down: #2cc483; --warn: #e5a93b;
     --bull-bg: #3a1c1e; --bear-bg: #14301f; --flat-bg: #3a2f17; --na-bg: #23262d;
   }
 }
@@ -138,8 +138,12 @@ details[open].card > summary { margin-bottom: 8px; }
 .star.on { color: var(--c3); }
 .tap { cursor: pointer; }
 svg.intra { display: block; width: 100%; height: auto; overflow: visible; }
-svg.intra text { font-size: 10px; fill: var(--muted); paint-order: stroke; stroke: var(--card); stroke-width: 3px; }
-svg.intra .ref { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
+svg.tech { display: block; width: 100%; height: auto; overflow: visible; margin-top: 4px; }
+svg.tech text, svg.intra text { font-size: 10px; fill: var(--muted); paint-order: stroke; stroke: var(--card); stroke-width: 3px; }
+.leg { display: inline-flex; align-items: center; gap: 4px; }
+.leg i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; }
+.pane[hidden] { display: none; }
+svg.tech .ref, svg.intra .ref { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
 /* 自選股詳情：今天最低～最高的區間，▲ 現價、｜ 開盤 */
 .rng { position: relative; height: 8px; margin: 18px 4px 6px; border-radius: 4px; background: linear-gradient(90deg, var(--down), var(--up)); opacity: .85; }
 .rng b { position: absolute; transform: translateX(-50%); }

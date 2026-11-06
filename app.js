@@ -351,7 +351,8 @@ async function mergeServerData() {
   if (!IS_WEB) return 0;
   let idx;
   try { idx = JSON.parse(await httpGet('data/index.json?t=' + Date.now())); } catch (e) { return 0; }
-  const missing = (idx.files || []).filter(f => /^[dfo]_\d{4}-\d{2}-\d{2}\.csv$/.test(f) && Store.read(f) == null);
+  // c_＝籌碼（法人、融資券），w_＝集保大戶持股（每週）；o_ 舊格式（沒有開高低）也重抓
+  const missing = (idx.files || []).filter(f => /^[dfocw]_\d{4}-\d{2}-\d{2}\.csv$/.test(f) && (Store.read(f) == null || (f[0] === 'o' && App.otcOld && App.otcOld.has(f.slice(2, 12)))));
   if ((idx.files || []).includes('div.csv') && Store.read('div.csv') == null) missing.push('div.csv');
   const btVer = String(idx.backtest || '');
   if ((idx.files || []).includes('backtest.json') && Store.read('backtest_ver.txt') !== btVer) missing.push('backtest.json');
@@ -361,11 +362,13 @@ async function mergeServerData() {
     setStatus(`從網站同步資料（${i}/${missing.length}）…`, i / missing.length);
     await Promise.all(missing.slice(i, i + 6).map(async f => { Store.write(f, await httpGet('data/' + f)); }));
   }
+  pruneChips((idx.files || []).filter(f => /^[cw]_/.test(f)));
   if (missing.includes('backtest.json')) Store.write('backtest_ver.txt', btVer);
   if (missing.includes('div_otc.csv')) Store.write('otcdiv_ver.txt', odVer);
   return missing.length;
 }
 
+const pruneChips = keep => { const k = new Set(keep); for (const p of ['c_', 'w_']) for (const f of Store.list(p)) if (!k.has(f)) Store.del(f); };
 // Android 從網站拿電腦整理好的檔：內建資料比 DATA_DAYS 少時補抓更早的上市收盤和基本面快照，
 // 長期回測結果變了也重抓，兩邊才會一樣
 async function syncFromSite() {
@@ -375,7 +378,10 @@ async function syncFromSite() {
     const files = idx.files || [], get = async f => Store.write(f, await httpGet(base + 'data/' + f));
     const dated = (p, before) => files.map(f => new RegExp('^' + p + '(\\d{4}-\\d{2}-\\d{2})\\.csv$').exec(f)).filter(m => m && m[1] < before).map(m => m[0]).sort();
     const need = DATA_DAYS - App.dates.length, fd = listByPrefix('f_');
-    const todo = [...(need > 0 && App.dates.length ? dated('d_', App.dates[0]).slice(-need) : []), ...(fd.length ? dated('f_', fd[0]) : [])];
+    // 籌碼 c_／w_：電腦整理好的（Android 也從網站拿），網站沒有的舊檔刪掉
+    const chips = files.filter(f => /^[cw]_\d{4}-\d{2}-\d{2}\.csv$/.test(f));
+    pruneChips(chips);
+    const todo = [...(need > 0 && App.dates.length ? dated('d_', App.dates[0]).slice(-need) : []), ...(fd.length ? dated('f_', fd[0]) : []), ...chips.filter(f => Store.read(f) == null)];
     for (let i = 0; i < todo.length; i += 6) {
       setStatus(`補抓歷史資料（${i}/${todo.length}）…`, i / todo.length);
       await Promise.all(todo.slice(i, i + 6).map(get));
@@ -392,7 +398,9 @@ const OTC_FIRST = '2007-07-02';
 async function syncOtc() {
   const keep = new Set(App.dates.filter(d => d >= OTC_FIRST));
   const none = new Set(JSON.parse(Store.read('otc_none.json') || '[]'));
-  let todo = [...keep].filter(d => !none.has(d) && Store.read('o_' + d + '.csv') == null);
+  const old = App.otcOld || new Set();
+  let todo = [...keep].filter(d => !none.has(d) && (old.has(d) || Store.read('o_' + d + '.csv') == null));
+  for (const d of todo) if (old.has(d)) Store.del('o_' + d + '.csv');   // 舊格式：刪掉重抓
   if (todo.length) {
     try {
       const base = JSON.parse(Store.asset('ota.json') || '{}').base;
@@ -416,12 +424,12 @@ async function syncOtc() {
         await sleep(1500); continue;
       }
       const n = s => { const x = parseFloat(String(s).replace(/,/g, '')); return isFinite(x) ? x : null; };
-      const lines = ['#OTC,' + d, 'Code,Name,Close,Prev,Volume,Value'];
+      const lines = ['#OTC,' + d, 'Code,Name,Close,Prev,Volume,Value,Open,High,Low'];
       // 欄位：代號、名稱、收盤、漲跌、開盤、最高、最低、成交股數、成交金額…
       for (const r of t.data) {
         const c = n(r[2]), ch = n(r[3]), v = n(r[7]);
         if (!c || v == null) continue;
-        lines.push([String(r[0]).trim(), String(r[1]).trim().replace(/,/g, ' '), c, ch != null ? +(c - ch).toFixed(2) : '', v, n(r[8]) ?? ''].join(','));
+        lines.push([String(r[0]).trim(), String(r[1]).trim().replace(/,/g, ' '), c, ch != null ? +(c - ch).toFixed(2) : '', v, n(r[8]) ?? '', n(r[4]) ?? '', n(r[5]) ?? '', n(r[6]) ?? ''].join(','));
       }
       Store.write('o_' + d + '.csv', lines.join('\n'));
       await sleep(1500);
@@ -431,16 +439,19 @@ async function syncOtc() {
   for (const f of Store.list('o_')) if (!keep.has(f.slice(2, 12))) Store.del(f);
   loadOtc();
 }
+// 2026-11 起 o_ 檔多了 Open,High,Low 三欄（K 線、KD 用）；舊格式的日子記在 otcOld，同步時重新下載
 function loadOtc() {
-  App.otc = {}; App.otcNames = {};
+  App.otc = {}; App.otcNames = {}; App.otcOld = new Set();
+  const num = s => (s === '' || s == null ? null : +s);
   for (const d of App.dates) {
     if (d < OTC_FIRST) continue;
     const s = Store.read('o_' + d + '.csv');
     if (!s) continue;
-    const m = {};
-    for (const ln of s.split(/\r?\n/).slice(2)) {
+    const L = s.split(/\r?\n/), m = {};
+    if (!/,Open,High,Low/.test(L[1] || '')) App.otcOld.add(d);
+    for (const ln of L.slice(2)) {
       const p = ln.split(','); if (p.length < 6) continue;
-      m[p[0]] = { name: p[1], close: +p[2], prev: p[3] === '' ? null : +p[3], vol: +p[4], value: p[5] === '' ? null : +p[5] };
+      m[p[0]] = { name: p[1], close: +p[2], prev: num(p[3]), vol: +p[4], value: num(p[5]), o: num(p[6]), h: num(p[7]), l: num(p[8]) };
       App.otcNames[p[0]] = p[1];   // 日期由舊到新，留下最新的名稱
     }
     App.otc[d] = m;
@@ -918,10 +929,10 @@ function renderMine() {
   if (hist) h += `<section class="card">${chartBlock('mine')}</section>`;
 
   h += `<section class="card"><h3 class="sec0">持股（${st.list.length}）</h3>${st.list.length ? `<table class="tbl"><thead><tr><th>股票</th><th class="num">股數/均價</th><th class="num">市值/損益</th></tr></thead><tbody>${
-    st.list.map(x => `<tr data-act="quickSell" data-code="${x.code}"><td>${stockLine(x.code)}<div class="muted small">現價 ${px(x.price)}</div></td>
+    st.list.map(x => `<tr class="tap" data-act="stockDetail" data-code="${x.code}"><td>${stockLine(x.code)}<div class="muted small">現價 ${px(x.price)}</div></td>
       <td class="num">${x.shares.toLocaleString()}<div class="muted small">${px(x.avg)}</div></td>
       <td class="num">${money(x.value)}<div class="${ud(x.pnl)}">${signMoney(x.pnl)}（${fmtPct(x.pnl / x.cost)}）</div></td></tr>`).join('')
-  }</tbody></table><p class="muted small">點持股可以直接記錄賣出。均價含買進手續費。</p>` : empty('還沒有持股。先「入金」，再「買進」或設定「定期定額」。')}</section>`;
+  }</tbody></table><p class="muted small">點持股看走勢、技術分析和籌碼，也可以在裡面記錄賣出。均價含買進手續費。</p>` : empty('還沒有持股。先「入金」，再「買進」或設定「定期定額」。')}</section>`;
 
   h += `<section class="card"><h3 class="sec0">定期定額（${App.my.plans.length}）</h3>${App.my.plans.length ? App.my.plans.map(p => `
     <div class="txn"><div class="row between">${stockLine(p.code)}<b>${money(p.amount)} / 次</b></div>
@@ -1218,7 +1229,7 @@ function dayBar(i, c) {
   const q = App.days[i] && App.days[i].q[c];
   if (q && q[1] > 0) return { o: q[0], h: q[1], l: q[2], lots: q[4] / 1000 };
   const x = App.otc[App.dates[i]] && App.otc[App.dates[i]][c];
-  return x ? { lots: x.vol / 1000 } : {};
+  return x ? Object.assign({ lots: x.vol / 1000 }, x.h > 0 ? { o: x.o, h: x.h, l: x.l } : {}) : {};
 }
 // 一檔自選股目前的報價：即時 → 網頁版電腦上傳 → 最近收盤（和前一個收盤比漲跌）；o/h/l/y 是開高低和昨收
 function watchQuote(c) {
@@ -1293,8 +1304,142 @@ async function fillIntraday(c) {
 }
 // 振幅＝（最高－最低）÷ 昨收
 const amp = q => (q.h && q.l && q.y ? (q.h - q.l) / q.y : null);
-function openWatchDetail(c) {
-  const q = watchQuote(c), a = amp(q), today = ymd(new Date());
+// 個股詳情：走勢（分時、開高低、振幅）／技術（日 K、均線、KD、MACD）／籌碼（法人、融資券、集保大戶）
+// 自選股和我的帳戶的持股點進來都是這個；記住上次看的分頁
+const Detail = { tab: 'flow' };
+// 每日 K 棒（舊的在前）：上市收盤檔有開高低；上櫃舊格式只有收盤，開高低用收盤代替（flat）
+function dailyBars(c) {
+  const out = [];
+  for (let i = 0; i < App.dates.length; i++) {
+    const p = closeAt(i, c);
+    if (!p) continue;
+    const b = dayBar(i, c);
+    out.push({ d: App.dates[i], o: b.o || p, h: b.h || p, l: b.l || p, c: p, v: b.lots || 0, flat: !b.h });
+  }
+  // 盤中：今天還沒有收盤檔，用即時報價補一根
+  const q = watchQuote(c), today = ymd(new Date());
+  if (q.live && q.price && q.o && q.h && (!out.length || out[out.length - 1].d < today)) out.push({ d: today, o: q.o, h: q.h, l: q.l, c: q.price, v: q.lots || 0, live: true });
+  return out;
+}
+const sma = (a, n) => a.map((_, i) => (i + 1 < n ? null : a.slice(i + 1 - n, i + 1).reduce((s, x) => s + x, 0) / n));
+const ema = (a, n) => { const k = 2 / (n + 1); let e = null; return a.map(x => (e = e == null ? x : e + k * (x - e))); };
+// 均線 5/20/60、KD(9,3,3)、MACD(12,26,9)、RSI 14
+function indicators(B) {
+  const C = B.map(b => b.c), K = [], D = [];
+  let k = 50, d = 50;
+  B.forEach((b, i) => {
+    const w = B.slice(Math.max(0, i - 8), i + 1), hi = Math.max(...w.map(x => x.h)), lo = Math.min(...w.map(x => x.l));
+    const rsv = hi > lo ? (b.c - lo) / (hi - lo) * 100 : 50;
+    k = k * 2 / 3 + rsv / 3; d = d * 2 / 3 + k / 3; K.push(k); D.push(d);
+  });
+  const e12 = ema(C, 12), e26 = ema(C, 26), dif = C.map((_, i) => e12[i] - e26[i]), dea = ema(dif, 9);
+  let ag = 0, al = 0;
+  const rsi = C.map((x, i) => {
+    if (!i) return null;
+    const ch = x - C[i - 1], g = Math.max(ch, 0), l = Math.max(-ch, 0);
+    if (i <= 14) { ag += g / 14; al += l / 14; if (i < 14) return null; }
+    else { ag = (ag * 13 + g) / 14; al = (al * 13 + l) / 14; }
+    return al ? 100 - 100 / (1 + ag / al) : 100;
+  });
+  return { ma5: sma(C, 5), ma20: sma(C, 20), ma60: sma(C, 60), K, D, dif, dea, osc: dif.map((x, i) => x - dea[i]), rsi };
+}
+const MA_COL = { 5: 'var(--c3)', 20: 'var(--accent)', 60: 'var(--c4)' };
+// 日 K：上面 K 棒＋均線，下面成交量（紅漲綠跌，和台股看盤軟體一樣）
+function candleSvg(bars, I) {
+  const N = bars.length, W = 340, cw = W / N, bw = Math.max(1, cw * 0.65), x = i => (i + 0.5) * cw, PH = 150, VH = 34, vTop = PH + 8;
+  const vals = bars.flatMap(b => [b.h, b.l]).concat(...[5, 20, 60].map(n => I['ma' + n].filter(v => v != null)));
+  let hi = Math.max(...vals), lo = Math.min(...vals);
+  const pad = (hi - lo || hi * 0.01) * 0.05; hi += pad; lo -= pad;
+  const Y = v => (hi - v) / (hi - lo) * PH, vmax = Math.max(...bars.map(b => b.v), 1);
+  const col = b => (b.c > b.o ? 'var(--up)' : b.c < b.o ? 'var(--down)' : 'var(--muted)');
+  let g = '';
+  bars.forEach((b, i) => {
+    const c = col(b), y1 = Y(Math.max(b.o, b.c)), y2 = Y(Math.min(b.o, b.c)), vh = b.v / vmax * VH;
+    g += `<line x1="${x(i).toFixed(1)}" x2="${x(i).toFixed(1)}" y1="${Y(b.h).toFixed(1)}" y2="${Y(b.l).toFixed(1)}" stroke="${c}"/>`
+      + `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.8, y2 - y1).toFixed(1)}" fill="${c}"/>`
+      + `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${(vTop + VH - vh).toFixed(1)}" width="${bw.toFixed(1)}" height="${vh.toFixed(1)}" fill="${c}" opacity=".5"/>`;
+  });
+  for (const n of [5, 20, 60]) {
+    const p = I['ma' + n].map((v, i) => (v == null ? '' : `${x(i).toFixed(1)},${Y(v).toFixed(1)}`)).filter(Boolean).join(' ');
+    if (p) g += `<polyline points="${p}" fill="none" stroke="${MA_COL[n]}" stroke-width="1.2"/>`;
+  }
+  const H = vTop + VH + 14;
+  return `<svg class="tech" viewBox="0 0 ${W} ${H}" role="img" aria-label="日 K 線">${g}
+    <text x="${W - 2}" y="10" text-anchor="end">${px(hi)}</text><text x="${W - 2}" y="${PH - 2}" text-anchor="end">${px(lo)}</text>
+    <text x="0" y="${H - 2}">${bars[0].d.slice(5)}</text><text x="${W / 2}" y="${H - 2}" text-anchor="middle">${bars[N >> 1].d.slice(5)}</text><text x="${W}" y="${H - 2}" text-anchor="end">${bars[N - 1].d.slice(5)}</text>
+  </svg>`;
+}
+// 副圖：幾條線（KD、MACD）＋可選的柱狀（MACD 柱）和參考線
+function subSvg(lines, lo, hi, refs = [], hist = null) {
+  const N = lines[0].a.length, W = 340, H = 64, cw = W / N, x = i => (i + 0.5) * cw, Y = v => (hi - v) / (hi - lo) * H;
+  let g = refs.map(r => `<line x1="0" x2="${W}" y1="${Y(r).toFixed(1)}" y2="${Y(r).toFixed(1)}" class="ref"/>`).join('');
+  if (hist) g += hist.map((v, i) => `<rect x="${(x(i) - cw * 0.3).toFixed(1)}" y="${Math.min(Y(v), Y(0)).toFixed(1)}" width="${(cw * 0.6).toFixed(1)}" height="${Math.abs(Y(v) - Y(0)).toFixed(1)}" fill="${v >= 0 ? 'var(--up)' : 'var(--down)'}" opacity=".55"/>`).join('');
+  for (const L of lines) g += `<polyline points="${L.a.map((v, i) => `${x(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ')}" fill="none" stroke="${L.c}" stroke-width="1.2"/>`;
+  return `<svg class="tech" viewBox="0 0 ${W} ${H}" role="img">${g}</svg>`;
+}
+const TECH_DAYS = 60;
+function techPane(c) {
+  const B = dailyBars(c);
+  if (B.length < 10) return '<p class="muted small">歷史資料太少，畫不出技術線圖。</p>';
+  const I = indicators(B), s = Math.max(0, B.length - TECH_DAYS), cut = a => a.slice(s), bars = B.slice(s), n = B.length - 1;
+  const dif = cut(I.dif), dea = cut(I.dea), osc = cut(I.osc), m = Math.max(...dif.concat(dea, osc).map(Math.abs)) * 1.1 || 1;
+  const leg = (col, t) => `<span class="leg"><i style="background:${col}"></i>${t}</span>`;
+  const last = B[n], cross = (a, b) => (n > 0 && a[n - 1] <= b[n - 1] && a[n] > b[n] ? '黃金交叉' : n > 0 && a[n - 1] >= b[n - 1] && a[n] < b[n] ? '死亡交叉' : '');
+  const maRow = k => { const v = I['ma' + k][n]; return v == null ? '' : `<tr><td>${k} 日均線</td><td class="num">${px(v)}</td><td class="num ${ud(last.c - v)}">${last.c >= v ? '站上' : '跌破'}</td></tr>`; };
+  const kx = cross(I.K, I.D), mx = cross(I.dif, I.dea), r = I.rsi[n];
+  return `<div class="small row" style="gap:10px;flex-wrap:wrap">${leg(MA_COL[5], 'MA5')}${leg(MA_COL[20], 'MA20')}${leg(MA_COL[60], 'MA60')}<span class="muted">最近 ${bars.length} 個交易日${last.live ? '・今天是盤中即時' : ''}</span></div>
+    ${candleSvg(bars, { ma5: cut(I.ma5), ma20: cut(I.ma20), ma60: cut(I.ma60) })}
+    <div class="small row" style="gap:10px;margin-top:6px"><b>KD</b>${leg('var(--c3)', `K ${I.K[n].toFixed(1)}`)}${leg('var(--accent)', `D ${I.D[n].toFixed(1)}`)}${kx ? `<b class="${kx === '黃金交叉' ? 'up' : 'down'}">${kx}</b>` : ''}</div>
+    ${subSvg([{ a: cut(I.K), c: 'var(--c3)' }, { a: cut(I.D), c: 'var(--accent)' }], 0, 100, [20, 80])}
+    <div class="small row" style="gap:10px;margin-top:6px"><b>MACD</b>${leg('var(--c3)', `DIF ${I.dif[n].toFixed(2)}`)}${leg('var(--accent)', `MACD ${I.dea[n].toFixed(2)}`)}<span class="${ud(I.osc[n])}">柱 ${I.osc[n].toFixed(2)}</span>${mx ? `<b class="${mx === '黃金交叉' ? 'up' : 'down'}">${mx}</b>` : ''}</div>
+    ${subSvg([{ a: dif, c: 'var(--c3)' }, { a: dea, c: 'var(--accent)' }], -m, m, [0], osc)}
+    <table class="tbl" style="margin-top:10px"><tr><th>收盤 ${px(last.c)}</th><th class="num">數值</th><th class="num"></th></tr>
+      ${maRow(5)}${maRow(20)}${maRow(60)}
+      ${r != null ? `<tr><td>RSI 14</td><td class="num">${r.toFixed(1)}</td><td class="num">${r >= 70 ? '偏熱' : r <= 30 ? '偏冷' : ''}</td></tr>` : ''}</table>
+    ${bars.some(b => b.flat) ? '<p class="muted small">部分日子只有收盤價（上櫃舊資料還在補開高低），K 棒會是一條橫線。</p>' : ''}
+    <p class="muted small">KD 80 以上常被視為過熱、20 以下過冷；黃金交叉＝快線由下往上穿過慢線。指標只是參考，不是投資建議。</p>`;
+}
+// 籌碼：c_ 檔（每天，張）、w_ 檔（每週集保）；只抽出這一檔的那一行
+function chipLine(text, c) {
+  if (!text) return null;
+  const i = text.indexOf('\n' + c + ',');
+  if (i < 0) return null;
+  const e = text.indexOf('\n', i + 1);
+  return text.slice(i + 1, e < 0 ? undefined : e).trim().split(',').slice(1).map(x => (x === '' ? null : +x));
+}
+function chipsPane(c) {
+  const days = listByPrefix('c_').slice(-20).reverse().map(d => ({ d, v: chipLine(readCsv('c_', d), c) }));
+  const weeks = listByPrefix('w_').slice(-12).reverse().map(d => ({ d, v: chipLine(readCsv('w_', d), c) })).filter(w => w.v);
+  if (!days.length && !weeks.length) return `<p class="muted small">還沒有籌碼資料${Native ? '（按「每日建議」的更新資料下載）' : '（等電腦下次上傳）'}。</p>`;
+  const sg = v => (v == null ? '—' : `<span class="${ud(v)}">${v > 0 ? '+' : ''}${Math.round(v).toLocaleString()}</span>`);
+  const sum = (k, n) => days.slice(0, n).reduce((s, x) => s + ((x.v && x.v[k]) || 0), 0);
+  let h = '';
+  if (days.length) {
+    h += `<h4 style="margin:4px 0">三大法人買賣超（張）</h4>
+      <table class="tbl"><tr><th></th><th class="num">外資</th><th class="num">投信</th><th class="num">自營商</th><th class="num">合計</th></tr>
+      ${[5, 20].filter(n => n <= days.length || n === 5).map(n => `<tr><td><b>近 ${Math.min(n, days.length)} 日</b></td>${[0, 1, 2].map(k => `<td class="num"><b>${sg(sum(k, n))}</b></td>`).join('')}<td class="num"><b>${sg(sum(0, n) + sum(1, n) + sum(2, n))}</b></td></tr>`).join('')}
+      ${days.map(x => `<tr><td>${x.d.slice(5)}</td>${x.v ? [0, 1, 2].map(k => `<td class="num">${sg(x.v[k])}</td>`).join('') + `<td class="num">${sg((x.v[0] || 0) + (x.v[1] || 0) + (x.v[2] || 0))}</td>` : '<td colspan="4" class="muted small">沒有資料</td>'}</tr>`).join('')}</table>
+      <h4 style="margin:14px 0 4px">融資融券（張）</h4>
+      <table class="tbl"><tr><th></th><th class="num">融資餘額</th><th class="num">增減</th><th class="num">融券餘額</th><th class="num">增減</th></tr>
+      ${days.filter(x => x.v && x.v[3] != null).map(x => `<tr><td>${x.d.slice(5)}</td><td class="num">${money(x.v[3])}</td><td class="num">${sg(x.v[4])}</td><td class="num">${money(x.v[5])}</td><td class="num">${sg(x.v[6])}</td></tr>`).join('')}</table>`;
+    const z = days.find(x => x.v && x.v[3] > 0);
+    if (z && z.v[5] != null) h += `<p class="muted small">券資比 ${(z.v[5] / z.v[3] * 100).toFixed(1)}%（${z.d}）。融資增加通常代表散戶加碼。</p>`;
+  }
+  if (weeks.length) {
+    const w = weeks[0], p = weeks[1], dv = (k, dig) => (p ? `<div class="small ${ud(w.v[k] - p.v[k])}">${w.v[k] - p.v[k] > 0 ? '+' : ''}${(w.v[k] - p.v[k]).toFixed(dig)}</div>` : '');
+    h += `<h4 style="margin:14px 0 4px">集保股權分散（${w.d}）</h4>
+      <div class="grid3" style="margin-top:4px">
+        <div><div class="muted small">股東人數</div><b>${w.v[0].toLocaleString()}</b>${p ? `<div class="small ${ud(p.v[0] - w.v[0])}">${w.v[0] - p.v[0] > 0 ? '+' : ''}${(w.v[0] - p.v[0]).toLocaleString()}</div>` : ''}</div>
+        <div><div class="muted small">400 張以上大戶</div><b>${w.v[1].toFixed(2)}%</b>${dv(1, 2)}</div>
+        <div><div class="muted small">1000 張以上大戶</div><b>${w.v[2].toFixed(2)}%</b>${dv(2, 2)}</div>
+      </div>
+      <p class="muted small">集保結算所每週公布一次（週五的資料）。${p ? `和前一週（${p.d}）比；大戶比例增加、股東人數減少，通常代表籌碼集中。` : '目前只有這一週，之後每週累積，就能看出變化。'}</p>`;
+  }
+  return h + '<p class="muted small">資料來源：證交所、櫃買中心（每天晚上更新）、集保結算所。</p>';
+}
+function openStockDetail(c, tab) {
+  if (tab) Detail.tab = tab;
+  const q = watchQuote(c), a = amp(q), today = ymd(new Date()), held = myState().hold[c];
   const cell = (l, v, cls = '') => `<div><div class="muted small">${l}</div><b class="${cls}">${v}</b></div>`;
   const pc = v => (v && q.y ? ud(v / q.y - 1) : '');
   // 今天的最低～最高，標出現價和開盤
@@ -1313,8 +1458,18 @@ function openWatchDetail(c) {
     rows.push(`<tr><td>${App.dates[i].slice(5)}</td><td class="num">${px(p)}</td><td class="num ${ud(r)}">${r != null ? fmtPct(r) : ''}</td>
       <td class="num">${b.h ? `${px(b.l)}～${px(b.h)}` : '—'}</td><td class="num">${am != null ? fmtPct(am, 1).replace('+', '') : '—'}</td></tr>`);
   }
+  const tabs = [['flow', '走勢'], ['tech', '技術'], ['chips', '籌碼']];
   openSheet(`${nm(c)} ${c}`, `<div class="row between"><div><b class="big ${ud(q.chg)}">${px(q.price)}</b> <span class="${ud(q.chg)}">${q.chg != null ? fmtPct(q.chg) : ''}</span></div>
       <div class="muted small">${esc(when)}</div></div>
+    <div class="row" style="gap:6px;margin-top:8px">
+      <button type="button" class="btn-sm" data-act="quickBuy" data-code="${esc(c)}">記錄買進</button>
+      ${held ? `<button type="button" class="btn-sm" data-act="quickSell" data-code="${esc(c)}">記錄賣出</button>` : ''}
+      <button type="button" class="btn-sm ghost" data-act="detailWatch" data-code="${esc(c)}">${inWatch(c) ? '★ 已在自選股' : '☆ 加入自選股'}</button></div>
+    ${held ? `<div class="small" style="margin-top:6px"><span class="tag">我的持股</span> ${held.shares.toLocaleString()} 股・均價 ${px(held.cost / held.shares)}${q.price ? `　<b class="${ud(q.price / (held.cost / held.shares) - 1)}">${fmtPct(q.price / (held.cost / held.shares) - 1)}</b>` : ''}</div>` : ''}
+    <div class="chips seg" style="margin-top:10px">${tabs.map(([v, l]) => `<button type="button" class="${Detail.tab === v ? 'on' : ''}" data-act="detailTab" data-v="${v}">${l}</button>`).join('')}</div>
+    <div class="pane" data-pane="tech" ${Detail.tab === 'tech' ? '' : 'hidden'}>${techPane(c)}</div>
+    <div class="pane" data-pane="chips" ${Detail.tab === 'chips' ? '' : 'hidden'}>${chipsPane(c)}</div>
+    <div class="pane" data-pane="flow" ${Detail.tab === 'flow' ? '' : 'hidden'}>
     <div id="intra" data-code="${esc(c)}" class="muted small" style="margin-top:8px">讀取分時走勢…</div>
     <div class="grid3" style="margin-top:10px">
       ${cell('開盤', px(q.o), pc(q.o))}${cell('最高', px(q.h), pc(q.h))}${cell('最低', px(q.l), pc(q.l))}
@@ -1323,8 +1478,13 @@ function openWatchDetail(c) {
     ${!q.h && isOtcCode(c) && !q.live ? '<p class="muted small">上櫃的收盤資料只有收盤價；盤中有即時報價時才看得到開高低和振幅。</p>' : ''}
     <h4 style="margin:14px 0 4px">最近 ${rows.length} 個交易日</h4>
     <table class="tbl"><tr><th>日期</th><th class="num">收盤</th><th class="num">漲跌</th><th class="num">最低～最高</th><th class="num">振幅</th></tr>${rows.join('')}</table>
-    <p class="muted small">振幅＝（最高－最低）÷ 昨收。</p>`, () => '');
+    <p class="muted small">振幅＝（最高－最低）÷ 昨收。</p></div>`, () => '');
   fillIntraday(c);
+}
+function detailTab(v) {
+  Detail.tab = v;
+  for (const b of document.querySelectorAll('#sheetBody [data-act="detailTab"]')) b.classList.toggle('on', b.dataset.v === v);
+  for (const p of document.querySelectorAll('#sheetBody .pane')) p.hidden = p.dataset.pane !== v;
 }
 function renderWatch() {
   const L = watchList(), sim = App.sim, mine = myState().hold, today = ymd(new Date());
@@ -1369,7 +1529,7 @@ function renderWatch() {
       <div class="row between" style="margin-top:6px"><button class="btn-sm" data-act="quickBuy" data-code="${esc(c)}">記錄買進</button>
         <button class="link" data-act="watchToggle" data-code="${esc(c)}">移除</button></div></div>`;
   }).join('')}</div>
-  <p class="muted small">點股票名稱看開高低、振幅和最近 10 天。策略持有＝百萬模擬帳戶目前的持股；均價含手續費。自選股只存在這支手機（備份會一起帶走），按「分享清單」可以傳給朋友。</p>`;
+  <p class="muted small">點股票名稱看走勢、技術分析和籌碼。策略持有＝百萬模擬帳戶目前的持股；均價含手續費。自選股只存在這支手機（備份會一起帶走），按「分享清單」可以傳給朋友。</p>`;
   return h;
 }
 function openWatchAdd() {
@@ -1806,7 +1966,9 @@ document.addEventListener('click', e => {
     case 'watchToggle': watchToggle(code); break;
     case 'watchAdd': openWatchAdd(); break;
     case 'watchShare': openWatchShare(); break;
-    case 'watchDetail': openWatchDetail(code); break;
+    case 'watchDetail': case 'stockDetail': openStockDetail(code); break;
+    case 'detailTab': detailTab(el.dataset.v); break;
+    case 'detailWatch': watchToggle(code); el.textContent = inWatch(code) ? '★ 已在自選股' : '☆ 加入自選股'; break;
     case 'rankMode': Rank.mode = el.dataset.v; render(); break;
     case 'rankBy': Rank.by = el.dataset.v; render(); break;
     case 'rankEtf': Rank.etf = el.dataset.v === '1'; render(); break;
@@ -1977,7 +2139,7 @@ async function boot() {
       syncOtcDividends().then(() => { loadDivs(); render(); }).catch(() => {}).finally(() => setStatus(null));
     }
     // 上櫃收盤缺天（例如剛更新到保留完整歷史的版本）：背景補齊
-    if (Native && last && App.dates.filter(d => d >= OTC_FIRST && !App.otc[d]).length > 5 && !App.busy) {
+    if (Native && last && (App.dates.filter(d => d >= OTC_FIRST && !App.otc[d]).length > 5 || App.otcOld.size) && !App.busy) {
       App.busy = true;
       syncOtc().catch(() => {}).finally(() => { App.busy = false; setStatus(null); render(); });
     }
