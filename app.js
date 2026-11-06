@@ -117,7 +117,7 @@ const readCsv = (prefix, d) => Store.read(prefix + d + '.csv') ?? Store.asset('s
 
 // Android 和網頁版都只用最近 DATA_DAYS 個交易日（和網站 publish.ps1 放的一樣多），兩邊可選的模擬起始日才會相同。
 // 更舊的檔案刪掉省空間（APK 內建的刪不掉，直接不讀）；更長的歷史看長期回測（電腦用 2004 年起的資料算）
-const DATA_DAYS = 300;
+const DATA_DAYS = 365;
 function loadData() {
   App.names = {};
   const all = listByPrefix('d_');
@@ -366,6 +366,21 @@ async function mergeServerData() {
   return missing.length;
 }
 
+// Android 內建資料比 DATA_DAYS 少時，從網站補抓更早的上市收盤，兩邊天數才會一樣
+async function syncHistory() {
+  const need = DATA_DAYS - App.dates.length;
+  if (need <= 0 || !App.dates.length) return;
+  try {
+    const base = JSON.parse(Store.asset('ota.json') || '{}').base;
+    const files = JSON.parse(await httpGet(base + 'data/index.json?t=' + Date.now())).files || [];
+    const old = files.map(f => /^d_(\d{4}-\d{2}-\d{2})\.csv$/.exec(f)).filter(m => m && m[1] < App.dates[0]).map(m => m[1]).sort().slice(-need);
+    for (let i = 0; i < old.length; i += 6) {
+      setStatus(`補抓歷史收盤（${i}/${old.length}）…`, i / old.length);
+      await Promise.all(old.slice(i, i + 6).map(async d => { Store.write('d_' + d + '.csv', await httpGet(base + 'data/d_' + d + '.csv')); }));
+    }
+  } catch (e) { /* 網站連不到，下次再補 */ }
+}
+
 // 上櫃收盤（櫃買中心）：成交量排行、帳戶裡上櫃持股的價格都用這份，和上市資料保留一樣多天（策略選股只用上市）。
 // 櫃買中心的資料從 2007-07-02 開始。網頁版（櫃買中心不開放跨站讀取）靠電腦上傳到網站的 o_ 檔；
 // Android 先從網站抓電腦整理好的檔（快），網站沒有的才一天一天向櫃買中心下載
@@ -459,6 +474,7 @@ async function syncData(opts = {}) {
     }
     Store.write('no_trade.json', JSON.stringify([...noTrade]));
     loadData();
+    if (Native && App.dates.length < DATA_DAYS) { await syncHistory(); loadData(); }
     if (Native) { setStatus('更新上櫃收盤…', k / total); await syncOtc(); }
     // 網頁版沒辦法直接讀證交所 openapi（跨網站限制），基本面只靠電腦上傳
     if (Native) {
@@ -1850,7 +1866,7 @@ async function boot() {
   if (IS_ANDROID_BROWSER) otaBanner('這支 Android 手機可以安裝 App 版（即時排行更快）', 'getApk', '下載');
   if (Native && Native.setReminder) Native.setReminder(App.settings.reminder.h, App.settings.reminder.m, App.settings.reminder.on);
   const last = App.dates[App.dates.length - 1];
-  if ((Native || IS_WEB) && (!last || last < lastExpectedTradingDay())) syncData();
+  if ((Native || IS_WEB) && (!last || last < lastExpectedTradingDay() || (Native && App.dates.length < DATA_DAYS))) syncData();
   else {
     if ((Native || IS_WEB) && !App.divList.length && last) {
       syncDividends().then(() => { computeSim(); render(); }).catch(() => {}).finally(() => setStatus(null));
