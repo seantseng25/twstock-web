@@ -11,6 +11,13 @@ const DEFAULT_CFG = {
   atrMult: 2, minPrice: 10, minVol20: 500000, peadMinYoY: 20,
   fee: 0.001425, tax: 0.003, slip: 0.0005, minFee: 20, acctSlots: 30,
   capital: 1000000, exitDays: 1,
+  // 模擬帳戶的資金配置（預設＝原本做法）
+  sizing: 'fixed',      // 每檔買進金額：'fixed' 本金 ÷ acctSlots；'equity' 目前總資產 ÷ acctSlots（賺了錢部位跟著變大）
+  picks: true,          // false：帳戶不買個股（三組照樣產生訊號和紙上績效）
+  park: null,           // 例如 '0050'：沒用到的現金停泊在這檔 ETF
+  parkMA: 0,            // 停泊條件：加權指數在 N 日均線之上才停泊，跌破就賣回現金（0＝一直停泊）
+  parkBand: 0,          // 均線上下的緩衝（0.02＝站上均線 2% 才買、跌破 2% 才賣），減少來回進出
+  etfTax: 0.001,        // ETF 證交稅 0.1%
 };
 
 function num(s) {
@@ -73,6 +80,26 @@ function dividendNet(gross) {
   return { gross, nhi, remit, net: Math.max(0, gross - nhi - remit) };
 }
 
+// ETF 分割（例如 0050 在 2025-06-18 一拆四）證交所的除權息資料沒有，收盤價會突然變成幾分之一。
+// 偵測 00 開頭代號跌到上一個收盤的 6 成以下、且前後價格接近整數倍，補一筆「配股」事件：每股配 k−1 股，參考價 = 前收 ÷ k。
+// 分割前會停止交易幾天，所以「上一個收盤」是這檔最後有成交的那天。
+function addSplits(days, divs) {
+  const out = [], lastClose = Object.create(null);
+  for (let i = 0; i < days.length; i++) {
+    const b = days[i].q, date = days[i].date;
+    for (const c in b) {
+      if (!c.startsWith('00') || !(b[c][3] > 0)) continue;
+      const prev = lastClose[c]; lastClose[c] = b[c][3];
+      if (!prev) continue;
+      const r = prev / b[c][3], k = Math.round(r);
+      if (r < 1 / 0.6 || k < 2 || Math.abs(r - k) > 0.15 * k || (divs[date] && divs[date][c])) continue;
+      (divs[date] || (divs[date] = {}))[c] = { prev, ref: prev / k, cash: 0, stock: k - 1 };
+      out.push({ date, code: c, k });
+    }
+  }
+  return out;
+}
+
 // 從 startIdx 開始逐日跑紙上交易與 100 萬模擬帳戶。fundAt(date) 回傳當天可用的基本面快照。
 // divs：{ 除權息日: { code: { prev, ref, cash, stock } } }，prev/ref 是除權息前收盤與參考價，cash 每股現金股利，stock 每股配股。
 function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
@@ -81,7 +108,7 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
   for (const k of GROUPS) {
     G[k] = { key: k, w: k === 'Core' ? 1 / cfg.coreCap : 1 / 30, navG: 1, navN: 1, pos: [], pendBuy: [], pendSell: [], closed: [], closedN: 0, closedSum: 0 };
   }
-  const acct = { cash: cfg.capital, fees: 0, divs: 0, hold: [], trades: [] };
+  const acct = { cash: cfg.capital, fees: 0, divs: 0, hold: [], trades: [], parkOn: false, lastTotal: cfg.capital };
   const perf = [], log = [];
   let fund = {}, cache = new Map();
   const nm = c => (names && names[c]) || c;
@@ -267,35 +294,54 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
         amount: d.gross, fee: d.nhi + d.remit, tax: 0, pnl: null,
         why: `現金股利每股 ${e.cash.toFixed(2)} 元` + (add ? `、配股 ${add} 股` : '') + (d.nhi ? `（已扣二代健保 ${d.nhi}）` : '') });
     }
+    // 賣出 shares 股：整張用開盤價，零股用收盤價 −0.1%
+    function sell(h, shares, q, gk, why) {
+      const whole = Math.floor(shares / 1000) * 1000, odd = shares - whole, rate = h.code.startsWith('00') ? cfg.etfTax : cfg.tax;
+      const a1 = whole * q[0], a2 = odd * q[3] * 0.999;
+      const fee = tradeFee(a1, false) + tradeFee(a2, true), tax = Math.floor(a1 * rate) + Math.floor(a2 * rate);
+      const cost = h.cost * shares / h.shares;
+      acct.cash += a1 + a2 - fee - tax; acct.fees += fee + tax;
+      if (shares >= h.shares) acct.hold.splice(acct.hold.indexOf(h), 1); else { h.shares -= shares; h.cost -= cost; }
+      acct.trades.push({ date, group: gk, code: h.code, name: nm(h.code), side: '賣出', shares, price: (a1 + a2) / shares,
+        amount: a1 + a2, fee, tax, pnl: a1 + a2 - fee - tax - cost, why });
+    }
+    // 用 amount 元買進：整張用開盤價，剩下的零股用收盤價 +0.1%；錢不夠就買不起
+    function buy(gk, code, q, amount, why) {
+      const lots = Math.floor(amount / (q[0] * 1000)), a1 = lots * 1000 * q[0];
+      const oddPx = q[3] * 1.001, odd = Math.floor((amount - a1) / oddPx), a2 = odd * oddPx;
+      const shares = lots * 1000 + odd;
+      if (shares <= 0) return false;
+      const fee = tradeFee(a1, false) + tradeFee(a2, true);
+      if (a1 + a2 + fee > acct.cash) return false;
+      acct.cash -= a1 + a2 + fee; acct.fees += fee;
+      const h = acct.hold.find(x => x.key === gk + '|' + code);
+      if (h) { h.shares += shares; h.cost += a1 + a2 + fee; }
+      else acct.hold.push({ key: gk + '|' + code, group: gk, code, shares, cost: a1 + a2 + fee, last: q[3], date });
+      acct.trades.push({ date, group: gk, code, name: nm(code), side: '買進', shares, price: (a1 + a2) / shares, amount: a1 + a2, fee, tax: 0, pnl: null, why });
+      return true;
+    }
     for (const gk of GROUPS) {
       for (const s of G[gk].pendSell) {
-        const key = gk + '|' + s.code, h = acct.hold.find(x => x.key === key), q = Q(t, s.code);
-        if (!h || !q || q[0] <= 0) continue;
-        const whole = Math.floor(h.shares / 1000) * 1000, odd = h.shares - whole;
-        const a1 = whole * q[0], a2 = odd * q[3] * 0.999;
-        const fee = tradeFee(a1, false) + tradeFee(a2, true), tax = Math.floor(a1 * cfg.tax) + Math.floor(a2 * cfg.tax);
-        acct.cash += a1 + a2 - fee - tax; acct.fees += fee + tax;
-        acct.hold.splice(acct.hold.indexOf(h), 1);
-        acct.trades.push({ date, group: gk, code: s.code, name: nm(s.code), side: '賣出', shares: h.shares, price: (a1 + a2) / h.shares,
-          amount: a1 + a2, fee, tax, pnl: a1 + a2 - fee - tax - h.cost, why: s.why });
+        const h = acct.hold.find(x => x.key === gk + '|' + s.code), q = Q(t, s.code);
+        if (h && q && q[0] > 0) sell(h, h.shares, q, gk, s.why);
       }
     }
-    const budget = cfg.capital / cfg.acctSlots;
-    for (const gk of GROUPS) {
-      for (const b of G[gk].pendBuy) {
-        const q = Q(t, b.code);
-        if (!q || q[0] <= 0) continue;
-        const lots = Math.floor(budget / (q[0] * 1000)), a1 = lots * 1000 * q[0];
-        const oddPx = q[3] * 1.001, odd = Math.floor((budget - a1) / oddPx), a2 = odd * oddPx;
-        const shares = lots * 1000 + odd;
-        if (shares <= 0) continue;
-        const fee = tradeFee(a1, false) + tradeFee(a2, true);
-        if (a1 + a2 + fee > acct.cash) continue;   // 錢不夠就買不起
-        acct.cash -= a1 + a2 + fee; acct.fees += fee;
-        acct.hold.push({ key: gk + '|' + b.code, group: gk, code: b.code, shares, cost: a1 + a2 + fee, last: q[3], date });
-        acct.trades.push({ date, group: gk, code: b.code, name: nm(b.code), side: '買進', shares, price: (a1 + a2) / shares,
-          amount: a1 + a2, fee, tax: 0, pnl: null, why: b.why });
-      }
+    const budget = (cfg.sizing === 'equity' ? acct.lastTotal : cfg.capital) / cfg.acctSlots;
+    // 停泊 ETF：大盤轉弱就全部賣回現金；要買個股、現金不夠時先賣掉需要的部分
+    const pq = cfg.park ? Q(t, cfg.park) : null, ph = pq && pq[0] > 0 ? acct.hold.find(h => h.group === 'Park') : null;
+    if (ph) {
+      let need = 0;
+      if (!acct.parkOn) need = Infinity;
+      else if (cfg.picks) { for (const gk of GROUPS) need += G[gk].pendBuy.length * budget; need -= acct.cash; }
+      if (need > 0) sell(ph, need === Infinity ? ph.shares : Math.min(ph.shares, Math.ceil(need / pq[0] / 1000) * 1000), pq, 'Park',
+        need === Infinity ? '大盤跌破均線，停泊資金換回現金' : '賣出停泊 ETF 換現金買個股');
+    }
+    if (cfg.picks) {
+      for (const gk of GROUPS) for (const b of G[gk].pendBuy) { const q = Q(t, b.code); if (q && q[0] > 0) buy(gk, b.code, q, budget, b.why); }
+    }
+    if (pq && pq[0] > 0 && acct.parkOn) {
+      const spare = acct.cash - acct.lastTotal * 0.005;   // 留一點現金付手續費
+      if (spare > Math.max(30000, acct.lastTotal * 0.03)) buy('Park', cfg.park, pq, spare, '閒置資金停泊');
     }
   }
   function acctValue(t) {
@@ -409,6 +455,13 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
     const shorts = reg.name === '偏空' ? shortRefs(t, uni, rs) : [];
 
     const av = acctValue(t);
+    acct.lastTotal = av.total;
+    // 停泊 ETF 的開關（明天開盤執行）：指數在均線＋緩衝之上才停泊，跌破均線−緩衝就撤
+    if (cfg.park) {
+      const m = cfg.parkMA ? idxMA(t, cfg.parkMA) : null;
+      if (!cfg.parkMA) acct.parkOn = true;
+      else if (m) { if (D.index > m * (1 + cfg.parkBand)) acct.parkOn = true; else if (D.index < m * (1 - cfg.parkBand)) acct.parkOn = false; }
+    }
     const comb = GROUPS.reduce((s, k) => s + G[k].navN, 0) / GROUPS.length;
     perf.push({ date: D.date, index: D.index, regime: reg.name, comb, acct: av.total,
       Core: G.Core.navN, CoreG: G.Core.navG, Value: G.Value.navN, ValueG: G.Value.navG, Pead: G.Pead.navN, PeadG: G.Pead.navG });

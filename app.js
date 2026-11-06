@@ -569,6 +569,7 @@ function render() {
   $('#main').innerHTML = html;
   drawCharts();
   rankAuto();
+  renderIdx();
 }
 
 const regimeClass = n => ({ '偏多': 'bull', '偏空': 'bear', '方向不明': 'flat' }[n] || 'na');
@@ -925,6 +926,7 @@ async function fetchWebLiveRank() {
   if (App.tab === 'rank') render();
   try {
     const j = JSON.parse(await httpGet(liveRankUrl() + '?t=' + Date.now()));
+    idxFromPc(j); renderIdx();
     Rank.live = { rows: j.rows.map(r => ({ code: r[0], name: r[1], otc: r[2] === 1, price: r[3], chg: r[4], lots: r[5], value: r[6] })),
       date: j.date, time: j.time, at: Date.now(), uploaded: j.at, fromPc: true };
   } catch (e) { Rank.err = '讀不到電腦上傳的即時排行（電腦可能沒開，或今天還沒上傳）。'; }
@@ -1063,6 +1065,63 @@ function rankAuto() {
   if (!want && Rank.timer) { clearInterval(Rank.timer); Rank.timer = null; }
   // 失敗後不馬上重試（至少隔 1 分鐘），免得一直打證交所
   if (want && !Rank.loading && Date.now() - (Rank.tried || 0) > 60000 && (!Rank.live || inSession())) fetchLiveRank();
+}
+
+// ---------------------------------------------------------- 即時指數（畫面上方，每個分頁都看得到）
+// Android 直接查證交所即時報價（盤中每 20 秒）；網頁版讀電腦每 2 分鐘上傳的 rank.json 裡的指數
+const Idx = { data: null, at: 0, busy: false };
+const d8 = s => (s && s.length === 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : '');
+function idxFromPc(j) {
+  if (!j || !j.idx) return;
+  const one = a => (a ? { p: a[0], y: a[1], h: a[2], l: a[3], t: a[4] } : null);
+  Idx.data = { tse: one(j.idx.tse), otc: one(j.idx.otc), date: j.date, uploaded: j.at, fromPc: true };
+  Idx.at = Date.now();
+}
+async function fetchIndex() {
+  if (Idx.busy) return;
+  Idx.busy = true;
+  try {
+    if (Native) {
+      const j = JSON.parse(await httpGet('https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=' + encodeURIComponent('tse_t00.tw|otc_o00.tw')));
+      const d = { fromPc: false };
+      for (const m of j.msgArray || []) {
+        d[m.ex] = { p: posNum(m.z), y: posNum(m.y), h: posNum(m.h), l: posNum(m.l), t: m.t || '' };
+        d.date = d8(m.d);
+      }
+      if (d.tse || d.otc) { Idx.data = d; Idx.at = Date.now(); }
+    } else if (liveRankUrl()) idxFromPc(JSON.parse(await httpGet(liveRankUrl() + '?t=' + Date.now())));
+  } catch (e) { /* 抓不到就顯示上次的數字或最近收盤 */ }
+  Idx.busy = false;
+  renderIdx();
+}
+function renderIdx() {
+  const el = $('#idxbar');
+  if (!el) return;
+  let D = Idx.data;
+  if (!D || !(D.tse || D.otc)) {   // 沒有即時資料：用最近一天的收盤
+    const n = App.days.length;
+    if (n < 2) { el.classList.add('hidden'); return; }
+    D = { tse: { p: App.days[n - 1].index, y: App.days[n - 2].index }, date: App.dates[n - 1], closeOnly: true };
+  }
+  const cell = (name, x) => {
+    if (!x || !x.p) return `<div><div class="nm">${name}</div><div class="v">—</div></div>`;
+    const ch = x.y ? x.p - x.y : null;
+    return `<div><div class="nm">${name}</div><div class="v ${ud(ch)}">${x.p.toLocaleString('zh-TW', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+      <div class="c ${ud(ch)}">${ch == null ? '' : `${ch > 0 ? '▲' : ch < 0 ? '▼' : ''} ${Math.abs(ch).toLocaleString('zh-TW', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}（${fmtPct(ch / x.y)}）`}</div></div>`;
+  };
+  const today = ymd(new Date()), t = (D.tse && D.tse.t) || (D.otc && D.otc.t) || '';
+  let note;
+  if (D.closeOnly) note = `${D.date} 收盤`;
+  else if (D.date !== today) note = `${D.date} 收盤（今天還沒開盤或休市）`;
+  else if (D.fromPc) note = `${t}・電腦每 2 分鐘上傳，約晚 2～5 分鐘`;
+  else note = `${t}${inSession() ? '・盤中每 20 秒更新' : '・今日收盤'}`;
+  el.innerHTML = cell('加權指數', D.tse) + cell('櫃買指數', D.otc) + `<div class="t">${esc(note)}</div>`;
+  el.classList.remove('hidden');
+}
+function startIndexTimer() {
+  fetchIndex();
+  setInterval(() => { if (!document.hidden && (inSession() || !Idx.data)) fetchIndex(); }, Native ? 20000 : 60000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && Date.now() - Idx.at > 15000) fetchIndex(); });
 }
 
 // ---------------------------------------------------------- 設定
@@ -1482,6 +1541,7 @@ async function boot() {
   runDCA();
   render();
   if (Native && Native.bootOk) Native.bootOk();   // 告訴 OTA 這個版本能正常開機
+  startIndexTimer();
   if (IS_ANDROID_BROWSER) otaBanner('這支 Android 手機可以安裝 App 版（即時排行更快）', 'getApk', '下載');
   if (Native && Native.setReminder) Native.setReminder(App.settings.reminder.h, App.settings.reminder.m, App.settings.reminder.on);
   const last = App.dates[App.dates.length - 1];
