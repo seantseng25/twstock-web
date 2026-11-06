@@ -125,20 +125,23 @@ function loadData() {
 }
 
 // 除權息：div.csv（Date,Code,Prev,Ref,Cash,Stock）＝已發生的；div_next.json＝證交所預告
+// 上櫃另外放 div_otc.csv、div_otc_next.json（櫃買中心），讀進來合在一起，事件標 otc: true
 function loadDivs() {
   App.divs = {}; App.divList = [];
-  const text = Store.read('div.csv') ?? Store.asset('seed/div.csv');
-  if (text) {
-    for (const ln of text.split(/\r?\n/).slice(1)) {
+  const add = (text, otc) => {
+    for (const ln of (text || '').split(/\r?\n/).slice(1)) {
       const p = ln.split(',');
       if (p.length < 6) continue;
-      const e = { date: p[0], code: p[1], prev: +p[2], ref: +p[3], cash: +p[4], stock: +p[5] < STOCK_DIV_MIN ? 0 : +p[5] };
+      const e = { date: p[0], code: p[1], prev: +p[2], ref: +p[3], cash: +p[4], stock: +p[5] < STOCK_DIV_MIN ? 0 : +p[5], otc };
       (App.divs[e.date] || (App.divs[e.date] = {}))[e.code] = e;
       App.divList.push(e);
     }
-    App.divList.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-  }
-  try { App.divNext = JSON.parse(Store.read('div_next.json') || '[]'); } catch (e) { App.divNext = []; }
+  };
+  add(Store.read('div.csv') ?? Store.asset('seed/div.csv'), false);
+  add(Store.read('div_otc.csv'), true);
+  App.divList.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  const json = n => { try { return JSON.parse(Store.read(n) || '[]'); } catch (e) { return []; } };
+  App.divNext = json('div_next.json').concat(json('div_otc_next.json'));
 }
 const rocDate = s => { const m = /(\d+)年(\d+)月(\d+)日/.exec(String(s)); return m ? `${+m[1] + 1911}-${pad2(+m[2])}-${pad2(+m[3])}` : null; };
 
@@ -157,7 +160,7 @@ function parseExRight(r) {
 async function syncDividends() {
   const today = ymd(new Date()), first = App.dates[0];
   if (!first) return;
-  const have = App.divList, spans = [];
+  const have = App.divList.filter(e => !e.otc), spans = [];
   if (!have.length) spans.push([first, today]);
   else {
     if (first < have[0].date) spans.push([first, addDays(have[0].date, -1)]);
@@ -182,7 +185,42 @@ async function syncDividends() {
     Store.write('div_next.json', JSON.stringify(k.data.map(r => ({ date: rocDate(r[0]), code: String(r[1]).trim(), cash: num(r[7]), stock: num(r[4]) || 0 }))
       .filter(x => x.date)));
   }
+  if (Native) try { await syncOtcDividends(); } catch (e) { /* 上櫃除權息抓不到就沿用舊資料 */ }
   loadDivs();
+}
+
+// 上櫃除權息（Android）：第一次先從網站抓電腦整理好的完整檔（2007-12 起），之後向櫃買中心補最近的
+async function syncOtcDividends() {
+  if (Store.read('div_otc.csv') == null) {
+    try {
+      const base = JSON.parse(Store.asset('ota.json') || '{}').base;
+      const s = await httpGet(base + 'data/div_otc.csv?t=' + Date.now());
+      if (s.startsWith('Date,Code')) Store.write('div_otc.csv', s);
+    } catch (e) { /* 網站連不到就從頭向櫃買中心抓 */ }
+  }
+  const map = {};
+  for (const ln of (Store.read('div_otc.csv') || '').split(/\r?\n/).slice(1)) { const p = ln.split(','); if (p.length >= 6) map[p[0] + '|' + p[1]] = ln; }
+  const dates = Object.keys(map).map(k => k.slice(0, 10)).sort(), today = ymd(new Date());
+  const from = dates.length ? addDays(dates[dates.length - 1], -10) : '2007-01-01';
+  const slash = d => d.replace(/-/g, '%2F'), rd = s => rocDate(String(s).replace(/^(\d+)\/(\d+)\/(\d+).*/, '$1年$2月$3日'));
+  for (let s = from; s <= today; s = addDays(s, 365)) {
+    const e = addDays(s, 364) < today ? addDays(s, 364) : today;
+    setStatus(`下載上櫃除權息（${s.slice(0, 4)}）…`, 0.95);
+    const j = await fetchJson(`https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQ?startDate=${slash(s)}&endDate=${slash(e)}&response=json`);
+    // 欄位：0 除權息日期、1 代號、3 除權息前收盤價、4 除權息參考價、13 現金股利、14 每仟股無償配股
+    for (const r of ((j.tables || [])[0] || {}).data || []) {
+      const date = rd(r[0]), code = String(r[1]).trim(), P = num(r[3]), R = num(r[4]), cash = num(r[13]) || 0, stock = (num(r[14]) || 0) / 1000;
+      if (!date || !P || !R || (cash <= 0 && stock <= 0)) continue;   // 只有現金增資的不是股利
+      map[date + '|' + code] = [date, code, P, R, +cash.toFixed(6), +stock.toFixed(6)].join(',');
+    }
+    await sleep(1500);
+  }
+  Store.write('div_otc.csv', ['Date,Code,Prev,Ref,Cash,Stock'].concat(Object.keys(map).sort().map(k => map[k])).join('\n'));
+  // 預告表：欄位 0 除權息日期、1 代號、4 每股無償配股率、7 現金股利（「尚未公告」記成 null）
+  const k = await fetchJson('https://www.tpex.org.tw/www/zh-tw/bulletin/prePost?response=json');
+  const rows = ((k.tables || [])[0] || {}).data;
+  if (rows) Store.write('div_otc_next.json', JSON.stringify(rows.map(r => ({ date: rd(r[0]), code: String(r[1]).trim(), cash: num(r[7]), stock: num(r[4]) || 0 }))
+    .filter(x => x.date && (x.cash == null || x.cash > 0 || x.stock > 0))));   // 現金 0、配股 0＝只有現金增資，不是股利
 }
 function fundAt(date) {
   let r = App.funds[0];
@@ -311,11 +349,14 @@ async function mergeServerData() {
   if ((idx.files || []).includes('div.csv') && Store.read('div.csv') == null) missing.push('div.csv');
   const btVer = String(idx.backtest || '');
   if ((idx.files || []).includes('backtest.json') && Store.read('backtest_ver.txt') !== btVer) missing.push('backtest.json');
+  const odVer = String(idx.otcDiv || '');   // 上櫃除權息：網頁不能直接讀櫃買中心，內容變了就重抓電腦上傳的檔
+  if (odVer && Store.read('otcdiv_ver.txt') !== odVer) for (const f of ['div_otc.csv', 'div_otc_next.json']) if ((idx.files || []).includes(f)) missing.push(f);
   for (let i = 0; i < missing.length; i += 6) {
     setStatus(`從網站同步資料（${i}/${missing.length}）…`, i / missing.length);
     await Promise.all(missing.slice(i, i + 6).map(async f => { Store.write(f, await httpGet('data/' + f)); }));
   }
   if (missing.includes('backtest.json')) Store.write('backtest_ver.txt', btVer);
+  if (missing.includes('div_otc.csv')) Store.write('otcdiv_ver.txt', odVer);
   return missing.length;
 }
 
@@ -1652,6 +1693,8 @@ async function boot() {
   else {
     if ((Native || IS_WEB) && !App.divList.length && last) {
       syncDividends().then(() => { computeSim(); render(); }).catch(() => {}).finally(() => setStatus(null));
+    } else if (Native && Store.read('div_otc.csv') == null) {   // 剛更新到有上櫃除權息的版本
+      syncOtcDividends().then(() => { loadDivs(); render(); }).catch(() => {}).finally(() => setStatus(null));
     }
     // 上櫃收盤缺天（例如剛更新到保留完整歷史的版本）：背景補齊
     if (Native && last && App.dates.filter(d => d >= OTC_FIRST && !App.otc[d]).length > 5 && !App.busy) {
