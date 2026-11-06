@@ -136,6 +136,12 @@ details[open].card > summary { margin-bottom: 8px; }
 .chips.seg button { flex: 1; padding: 7px 12px; font-size: 15px; font-weight: 600; }
 .star { border: 0; background: none; padding: 0 4px; font-size: 17px; line-height: 1; color: var(--muted); }
 .star.on { color: var(--c3); }
+.tap { cursor: pointer; }
+/* 自選股詳情：今天最低～最高的區間，▲ 現價、｜ 開盤 */
+.rng { position: relative; height: 8px; margin: 18px 4px 6px; border-radius: 4px; background: linear-gradient(90deg, var(--down), var(--up)); opacity: .85; }
+.rng b { position: absolute; transform: translateX(-50%); }
+.rng-p { top: -11px; border: 6px solid transparent; border-top: 8px solid var(--text); border-bottom: 0; }
+.rng-o { top: -3px; width: 2px; height: 14px; background: var(--text); }
 .sug { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; margin: 4px 0; overflow: hidden; }
 .sug button { border: 0; border-top: 1px solid var(--line); background: var(--bg); text-align: left; padding: 9px 12px; font-size: 15px; }
 .sug button:first-child { border-top: 0; }

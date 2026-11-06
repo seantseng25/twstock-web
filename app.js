@@ -116,7 +116,7 @@ function listByPrefix(prefix) {
 const readCsv = (prefix, d) => Store.read(prefix + d + '.csv') ?? Store.asset('seed/' + prefix + d + '.csv');
 
 // Android 和網頁版都只用最近 DATA_DAYS 個交易日（和網站 publish.ps1 放的一樣多），兩邊可選的模擬起始日才會相同。
-// 更舊的檔案刪掉省空間（APK 內建的刪不掉，直接不讀）；更長的歷史看長期回測（電腦用 2004 年起的資料算）
+// 更舊的檔案刪掉省空間（APK 內建的刪不掉，直接不讀）；更長的歷史看長期回測（電腦用 2010 年起的資料算）
 const DATA_DAYS = 365;
 function loadData() {
   App.names = {};
@@ -366,18 +366,22 @@ async function mergeServerData() {
   return missing.length;
 }
 
-// Android 內建資料比 DATA_DAYS 少時，從網站補抓更早的上市收盤，兩邊天數才會一樣
-async function syncHistory() {
-  const need = DATA_DAYS - App.dates.length;
-  if (need <= 0 || !App.dates.length) return;
+// Android 從網站拿電腦整理好的檔：內建資料比 DATA_DAYS 少時補抓更早的上市收盤和基本面快照，
+// 長期回測結果變了也重抓，兩邊才會一樣
+async function syncFromSite() {
   try {
     const base = JSON.parse(Store.asset('ota.json') || '{}').base;
-    const files = JSON.parse(await httpGet(base + 'data/index.json?t=' + Date.now())).files || [];
-    const old = files.map(f => /^d_(\d{4}-\d{2}-\d{2})\.csv$/.exec(f)).filter(m => m && m[1] < App.dates[0]).map(m => m[1]).sort().slice(-need);
-    for (let i = 0; i < old.length; i += 6) {
-      setStatus(`補抓歷史收盤（${i}/${old.length}）…`, i / old.length);
-      await Promise.all(old.slice(i, i + 6).map(async d => { Store.write('d_' + d + '.csv', await httpGet(base + 'data/d_' + d + '.csv')); }));
+    const idx = JSON.parse(await httpGet(base + 'data/index.json?t=' + Date.now()));
+    const files = idx.files || [], get = async f => Store.write(f, await httpGet(base + 'data/' + f));
+    const dated = (p, before) => files.map(f => new RegExp('^' + p + '(\\d{4}-\\d{2}-\\d{2})\\.csv$').exec(f)).filter(m => m && m[1] < before).map(m => m[0]).sort();
+    const need = DATA_DAYS - App.dates.length, fd = listByPrefix('f_');
+    const todo = [...(need > 0 && App.dates.length ? dated('d_', App.dates[0]).slice(-need) : []), ...(fd.length ? dated('f_', fd[0]) : [])];
+    for (let i = 0; i < todo.length; i += 6) {
+      setStatus(`補抓歷史資料（${i}/${todo.length}）…`, i / todo.length);
+      await Promise.all(todo.slice(i, i + 6).map(get));
     }
+    const btVer = String(idx.backtest || '');
+    if (btVer && files.includes('backtest.json') && Store.read('backtest_ver.txt') !== btVer) { await get('backtest.json'); Store.write('backtest_ver.txt', btVer); }
   } catch (e) { /* 網站連不到，下次再補 */ }
 }
 
@@ -474,7 +478,7 @@ async function syncData(opts = {}) {
     }
     Store.write('no_trade.json', JSON.stringify([...noTrade]));
     loadData();
-    if (Native && App.dates.length < DATA_DAYS) { await syncHistory(); loadData(); }
+    if (Native) { await syncFromSite(); loadData(); }
     if (Native) { setStatus('更新上櫃收盤…', k / total); await syncOtc(); }
     // 網頁版沒辦法直接讀證交所 openapi（跨網站限制），基本面只靠電腦上傳
     if (Native) {
@@ -759,7 +763,7 @@ function groupHoldings(g) {
 }
 
 // ---------------------------------------------------------- 百萬模擬
-// 長期回測：電腦用完整歷史（2004 年起）跑同一套策略，手機只顯示結果
+// 長期回測：電腦用 2010 年起（三組資料齊全）的歷史跑同一套策略，手機只顯示結果
 function renderLongBacktest() {
   const bt = App.bt;
   if (!bt || !bt.runs || !bt.runs.length) return '';
@@ -1020,7 +1024,7 @@ async function fetchWebLiveRank() {
   try {
     const j = JSON.parse(await httpGet(liveRankUrl() + '?t=' + Date.now()));
     idxFromPc(j); renderIdx();
-    Rank.live = { rows: j.rows.map(r => ({ code: r[0], name: r[1], otc: r[2] === 1, price: r[3], chg: r[4], lots: r[5], value: r[6] })),
+    Rank.live = { rows: j.rows.map(r => ({ code: r[0], name: r[1], otc: r[2] === 1, price: r[3], chg: r[4], lots: r[5], value: r[6], o: r[7], h: r[8], l: r[9], y: r[10] })),
       date: j.date, time: j.time, at: Date.now(), uploaded: j.at, fromPc: true };
   } catch (e) { Rank.err = '讀不到電腦上傳的即時排行（電腦可能沒開，或今天還沒上傳）。'; }
   Rank.loading = false;
@@ -1200,7 +1204,7 @@ async function fetchWatchQuotes() {
       const j = JSON.parse(await httpGet('https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=' + encodeURIComponent(b.join('|'))));
       for (const m of j.msgArray || []) {
         const y = posNum(m.y), p = posNum(m.z) ?? posNum(m.trade && m.trade.z) ?? posNum(String(m.b || '').split('_')[0]);
-        Watch.q[m.c] = { price: p, chg: p && y ? p / y - 1 : null, lots: parseFloat(m.v) || 0, h: posNum(m.h), l: posNum(m.l), date: d8(m.d), time: m.t || '' };
+        Watch.q[m.c] = { price: p, chg: p && y ? p / y - 1 : null, lots: parseFloat(m.v) || 0, o: posNum(m.o), h: posNum(m.h), l: posNum(m.l), y, date: d8(m.d), time: m.t || '' };
         if ((m.d || '') + (m.t || '') > Watch.date + Watch.time) { Watch.date = m.d || ''; Watch.time = m.t || ''; }
       }
     }
@@ -1209,20 +1213,58 @@ async function fetchWatchQuotes() {
   if (Watch.again) { Watch.again = false; return fetchWatchQuotes(); }
   if (App.tab === 'rank' && Rank.view === 'watch' && !App.sheet) render();
 }
-// 一檔自選股目前的報價：即時 → 網頁版電腦上傳 → 最近收盤（和前一個收盤比漲跌）
+// 某天的開高低和成交張數：上市收盤檔有；上櫃收盤檔只有收盤，沒有開高低
+function dayBar(i, c) {
+  const q = App.days[i] && App.days[i].q[c];
+  if (q && q[1] > 0) return { o: q[0], h: q[1], l: q[2], lots: q[4] / 1000 };
+  const x = App.otc[App.dates[i]] && App.otc[App.dates[i]][c];
+  return x ? { lots: x.vol / 1000 } : {};
+}
+// 一檔自選股目前的報價：即時 → 網頁版電腦上傳 → 最近收盤（和前一個收盤比漲跌）；o/h/l/y 是開高低和昨收
 function watchQuote(c) {
   const today = ymd(new Date());
   const q = Watch.q[c], n = App.dates.length;
+  const close = i => { const p = closeAt(i, c), y = i > 0 ? closeAt(i - 1, c) : null; return Object.assign({ price: p, y, chg: y ? p / y - 1 : null, date: App.dates[i] }, dayBar(i, c)); };
   // 今天的正式收盤已經下載：用正式收盤（即時報價收盤後可能停在 13:30 以前）
-  if (App.dates[n - 1] === today && closeAt(n - 1, c)) { const p = closeAt(n - 1, c), y = n > 1 ? closeAt(n - 2, c) : null; return { price: p, chg: y ? p / y - 1 : null, date: today, final: true }; }
+  if (App.dates[n - 1] === today && closeAt(n - 1, c)) return Object.assign(close(n - 1), { final: true });
   if (Native && q && q.price && q.date === today) return Object.assign({ live: true }, q);
   const r = !Native && Rank.live && Rank.live.date === today && Rank.live.rows.find(x => x.code === c);
-  if (r && r.price) return { price: r.price, chg: r.chg, lots: r.lots, live: true, time: Rank.live.time, pc: true };
-  for (let i = n - 1; i >= 0; i--) {
-    const p = closeAt(i, c);
-    if (p) { const y = i > 0 ? closeAt(i - 1, c) : null; return { price: p, chg: y ? p / y - 1 : null, date: App.dates[i] }; }
-  }
+  if (r && r.price) return { price: r.price, chg: r.chg, lots: r.lots, o: r.o, h: r.h, l: r.l, y: r.y, live: true, time: Rank.live.time, pc: true };
+  for (let i = n - 1; i >= 0; i--) if (closeAt(i, c)) return close(i);
   return { price: null };
+}
+// 振幅＝（最高－最低）÷ 昨收
+const amp = q => (q.h && q.l && q.y ? (q.h - q.l) / q.y : null);
+function openWatchDetail(c) {
+  const q = watchQuote(c), a = amp(q), today = ymd(new Date());
+  const cell = (l, v, cls = '') => `<div><div class="muted small">${l}</div><b class="${cls}">${v}</b></div>`;
+  const pc = v => (v && q.y ? ud(v / q.y - 1) : '');
+  // 今天的最低～最高，標出現價和開盤
+  let bar = '';
+  if (q.h && q.l && q.h > q.l && q.price) {
+    const at = v => Math.max(0, Math.min(100, (v - q.l) / (q.h - q.l) * 100)).toFixed(1);
+    bar = `<div class="rng">${q.o ? `<b class="rng-o" style="left:${at(q.o)}%" title="開盤"></b>` : ''}<b class="rng-p" style="left:${at(q.price)}%"></b></div>
+      <div class="row between small"><span class="down">低 ${px(q.l)}</span><span class="muted">▼ 現價　｜ 開盤</span><span class="up">高 ${px(q.h)}</span></div>`;
+  }
+  const when = q.final ? `${today} 正式收盤` : q.live ? `即時 ${q.time || ''}${q.pc ? '（電腦上傳，約晚 2～5 分鐘）' : ''}` : q.date ? `${q.date} 收盤` : '';
+  const rows = [];
+  for (let i = App.dates.length - 1; i >= 0 && rows.length < 10; i--) {
+    const p = closeAt(i, c);
+    if (!p) continue;
+    const y = i > 0 ? closeAt(i - 1, c) : null, b = dayBar(i, c), r = y ? p / y - 1 : null, am = b.h && y ? (b.h - b.l) / y : null;
+    rows.push(`<tr><td>${App.dates[i].slice(5)}</td><td class="num">${px(p)}</td><td class="num ${ud(r)}">${r != null ? fmtPct(r) : ''}</td>
+      <td class="num">${b.h ? `${px(b.l)}～${px(b.h)}` : '—'}</td><td class="num">${am != null ? fmtPct(am, 1).replace('+', '') : '—'}</td></tr>`);
+  }
+  openSheet(`${nm(c)} ${c}`, `<div class="row between"><div><b class="big ${ud(q.chg)}">${px(q.price)}</b> <span class="${ud(q.chg)}">${q.chg != null ? fmtPct(q.chg) : ''}</span></div>
+      <div class="muted small">${esc(when)}</div></div>
+    <div class="grid3" style="margin-top:10px">
+      ${cell('開盤', px(q.o), pc(q.o))}${cell('最高', px(q.h), pc(q.h))}${cell('最低', px(q.l), pc(q.l))}
+      ${cell('昨收', px(q.y))}${cell('振幅', a != null ? fmtPct(a, 2).replace('+', '') : '—')}${cell('成交量', q.lots ? money(Math.round(q.lots)) + ' 張' : '—')}
+    </div>${bar}
+    ${!q.h && isOtcCode(c) && !q.live ? '<p class="muted small">上櫃的收盤資料只有收盤價；盤中有即時報價時才看得到開高低和振幅。</p>' : ''}
+    <h4 style="margin:14px 0 4px">最近 ${rows.length} 個交易日</h4>
+    <table class="tbl"><tr><th>日期</th><th class="num">收盤</th><th class="num">漲跌</th><th class="num">最低～最高</th><th class="num">振幅</th></tr>${rows.join('')}</table>
+    <p class="muted small">振幅＝（最高－最低）÷ 昨收。</p>`, () => '');
 }
 function renderWatch() {
   const L = watchList(), sim = App.sim, mine = myState().hold, today = ymd(new Date());
@@ -1261,13 +1303,13 @@ function renderWatch() {
     const m = mine[c];
     if (m) { const avg = m.cost / m.shares, r = q.price ? q.price / avg - 1 : null; lines.push(`<span class="tag">我的持股</span> ${m.shares.toLocaleString()} 股・均價 ${px(avg)}${r != null ? `　<b class="${ud(r)}">${fmtPct(r)}</b>` : ''}`); }
     return `<div class="item">
-      <div class="row between"><div class="stk"><b>${esc(nm(c))}</b><span class="code">${esc(c)}${isOtcCode(c) ? '・上櫃' : ''}</span></div>
+      <div class="row between"><div class="stk tap" data-act="watchDetail" data-code="${esc(c)}"><b>${esc(nm(c))} <span class="muted">›</span></b><span class="code">${esc(c)}${isOtcCode(c) ? '・上櫃' : ''}${amp(q) != null ? `・振幅 ${fmtPct(amp(q), 1).replace('+', '')}` : ''}</span></div>
         <div class="right"><b class="big ${ud(q.chg)}">${px(q.price)}</b><div class="small ${ud(q.chg)}">${q.chg != null ? fmtPct(q.chg) : ''}${q.date && q.date !== today ? `<span class="muted">・${q.date.slice(5)} 收盤</span>` : ''}</div></div></div>
       ${lines.map(x => `<div class="small" style="margin-top:4px">${x}</div>`).join('')}
       <div class="row between" style="margin-top:6px"><button class="btn-sm" data-act="quickBuy" data-code="${esc(c)}">記錄買進</button>
         <button class="link" data-act="watchToggle" data-code="${esc(c)}">移除</button></div></div>`;
   }).join('')}</div>
-  <p class="muted small">策略持有＝百萬模擬帳戶目前的持股；均價含手續費。自選股只存在這支手機（備份會一起帶走），按「分享清單」可以傳給朋友。</p>`;
+  <p class="muted small">點股票名稱看開高低、振幅和最近 10 天。策略持有＝百萬模擬帳戶目前的持股；均價含手續費。自選股只存在這支手機（備份會一起帶走），按「分享清單」可以傳給朋友。</p>`;
   return h;
 }
 function openWatchAdd() {
@@ -1409,7 +1451,7 @@ function renderSettings() {
     <label class="field"><span>本金</span><input id="setCap" type="number" inputmode="numeric" value="${s.capital}"></label>
     <label class="field"><span>核心組出場</span><select id="setExit">
       ${[[1, '穩健：跌破 20 日線就賣'], [2, '中庸：連 2 天才賣'], [3, '積極：連 3 天才賣']].map(([v, l]) => `<option value="${v}" ${s.exitDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <p class="muted small">起始日前要有 60 個交易日的歷史才能判斷大盤。App 和網頁版都保留最近 ${DATA_DAYS} 個交易日，可以選的起始日一樣；更長期的表現請看百萬模擬上方的長期回測（2004 年起）。</p>
+    <p class="muted small">起始日前要有 60 個交易日的歷史才能判斷大盤。App 和網頁版都保留最近 ${DATA_DAYS} 個交易日，可以選的起始日一樣；更長期的表現請看百萬模擬上方的長期回測（2010 年起）。</p>
     <button class="btn wide" data-act="saveSim">套用並重新模擬</button></section>
 
   <section class="card"><h3 class="sec0">我的帳戶手續費</h3>
@@ -1704,6 +1746,7 @@ document.addEventListener('click', e => {
     case 'watchToggle': watchToggle(code); break;
     case 'watchAdd': openWatchAdd(); break;
     case 'watchShare': openWatchShare(); break;
+    case 'watchDetail': openWatchDetail(code); break;
     case 'rankMode': Rank.mode = el.dataset.v; render(); break;
     case 'rankBy': Rank.by = el.dataset.v; render(); break;
     case 'rankEtf': Rank.etf = el.dataset.v === '1'; render(); break;
@@ -1769,7 +1812,7 @@ document.addEventListener('input', e => { if (App.sheet && App.sheet.onInput && 
 document.addEventListener('submit', e => {
   if (e.target.id !== 'sheetForm') return;
   e.preventDefault();
-  try { const msg = App.sheet.onSubmit(); closeSheet(); render(); toast(msg); }
+  try { const msg = App.sheet.onSubmit(); closeSheet(); render(); if (msg) toast(msg); }
   catch (err) { $('#sheetErr').textContent = err.message; }
 });
 
