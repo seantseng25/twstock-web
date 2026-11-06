@@ -9,7 +9,8 @@ self.addEventListener('activate', e => { e.waitUntil(self.clients.claim()); });
 
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
-  if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.includes('/data/')) return;
+  // 資料檔、Android 安裝檔（app/）和下載頁不經過快取
+  if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.includes('/data/') || url.pathname.includes('/app/') || url.pathname.endsWith('android.html')) return;
   e.respondWith(
     fetch(e.request).then(res => {
       if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>下載 Android App</title>
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+<style>
+  .wrap { max-width: 520px; margin: 0 auto; padding: 0 12px 24px; }
+  .app { display: flex; gap: 14px; align-items: center; }
+  .app img { width: 64px; height: 64px; border-radius: 14px; }
+  ol { padding-left: 20px; margin: 6px 0; } ol li { margin: 4px 0; }
+  a.btn { display: block; text-align: center; text-decoration: none; }
+  body { padding-bottom: 24px; }
+</style>
+</head>
+<body>
+<header class="topbar"><div class="title">Android App</div><a class="sub" href="./">← 回網頁版</a></header>
+<div class="wrap">
+  <section class="card">
+    <div class="app"><img src="icon-192.png" alt=""><div><div class="big">台股策略模擬</div><div class="muted small" id="ver">讀取版本中…</div></div></div>
+    <a class="btn wide" id="dl" href="app/twstock.apk" download="台股策略模擬.apk" style="margin-top:14px">下載 APK</a>
+    <p class="muted small" id="notes"></p>
+  </section>
+  <section class="card">
+    <h3 class="sec0">安裝方式</h3>
+    <ol class="small">
+      <li>用 Android 手機的 Chrome 打開這頁，按「下載 APK」。</li>
+      <li>下載完成後點通知或「檔案」裡的 APK。</li>
+      <li>第一次會要求允許「安裝不明應用程式」：到設定裡允許 Chrome（或檔案管理）安裝，再回來點一次。</li>
+      <li>已經裝過舊版的話直接覆蓋安裝，資料會保留。</li>
+    </ol>
+    <p class="muted small">裝好之後不用再回來下載：App 打開時會自動檢查更新，畫面和功能的更新按「立即套用」就好；主程式更新會跳出「下載安裝」。</p>
+  </section>
+  <section class="card">
+    <h3 class="sec0">App 版和網頁版的差別</h3>
+    <ul class="small" style="padding-left:20px;margin:6px 0">
+      <li>即時成交量排行直接向證交所抓，只有幾秒延遲（網頁版要等電腦上傳，約晚 2～5 分鐘）。</li>
+      <li>每天收盤後的提醒通知。</li>
+      <li>基本面資料手機自己更新，不用等電腦。</li>
+    </ul>
+    <p class="muted small">iPhone 不能安裝 APK，請用網頁版並「加入主畫面」。這是策略模擬工具，不是投資建議。</p>
+  </section>
+</div>
+<script>
+fetch('app/version.json?t=' + Date.now()).then(r => r.json()).then(v => {
+  document.getElementById('ver').textContent = `版本 ${v.versionName}・${v.built}`;
+  if (v.notes) document.getElementById('notes').textContent = '這版更新：' + v.notes;
+}).catch(() => { document.getElementById('ver').textContent = ''; });
+if (/iPhone|iPad/i.test(navigator.userAgent)) {
+  const a = document.getElementById('dl'); a.textContent = 'iPhone 不能安裝 APK，請用網頁版'; a.href = './'; a.removeAttribute('download');
+}
+</script>
+</body>
+</html>

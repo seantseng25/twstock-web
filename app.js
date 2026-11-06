@@ -904,16 +904,36 @@ function stmtRow(r) {
 
 // ---------------------------------------------------------- 成交量排行
 // 即時：證交所即時報價（mis.twse.com.tw）沒有排行榜 API，所以把所有上市股票分批查一次再自己排序；
-//       這個網址不開放網頁跨站讀取，只有 Android App（原生連線）能用。
+//       這個網址不開放網頁跨站讀取，只有 Android App（原生連線）能直接查；
+//       網頁版改讀電腦盤中每 2 分鐘上傳的排行（live_rank.ps1）。
 // 收盤／本週：用已下載的每日收盤資料計算，網頁版也能用。
-const Rank = { mode: Native ? 'live' : 'day', by: 'vol', etf: true, mkt: 'all', live: null, loading: false, done: 0, total: 0, err: '', timer: null };
+const Rank = { mode: 'live', by: 'vol', etf: true, mkt: 'all', live: null, loading: false, done: 0, total: 0, err: '', timer: null };
 const RANK_TOP = 30;
 const isEtf = c => c.startsWith('00');
 const posNum = s => { const x = parseFloat(s); return isFinite(x) && x > 0 ? x : null; };
 // 手機時間當台灣時間：週一到週五 08:55–13:35 視為盤中（自動每分鐘更新）
 const inSession = () => { const d = new Date(), w = d.getDay(), m = d.getHours() * 60 + d.getMinutes(); return w > 0 && w < 6 && m >= 535 && m <= 815; };
 
+// 網頁版：電腦盤中每 2 分鐘把排行上傳到 GitHub 的 live 分支（live_rank.ps1），從 raw.githubusercontent.com 讀
+function liveRankUrl() {
+  const m = /^([\w-]+)\.github\.io$/.exec(location.hostname), repo = location.pathname.split('/')[1];
+  return IS_WEB && m && repo ? `https://raw.githubusercontent.com/${m[1]}/${repo}/live/rank.json` : null;
+}
+const HAS_LIVE = !!(Native || liveRankUrl());
+async function fetchWebLiveRank() {
+  Object.assign(Rank, { loading: true, done: 0, total: 1, err: '', tried: Date.now() });
+  if (App.tab === 'rank') render();
+  try {
+    const j = JSON.parse(await httpGet(liveRankUrl() + '?t=' + Date.now()));
+    Rank.live = { rows: j.rows.map(r => ({ code: r[0], name: r[1], otc: r[2] === 1, price: r[3], chg: r[4], lots: r[5], value: r[6] })),
+      date: j.date, time: j.time, at: Date.now(), uploaded: j.at, fromPc: true };
+  } catch (e) { Rank.err = '讀不到電腦上傳的即時排行（電腦可能沒開，或今天還沒上傳）。'; }
+  Rank.loading = false;
+  if (App.tab === 'rank') render();
+}
+
 async function fetchLiveRank() {
+  if (!Native && liveRankUrl() && !Rank.loading) return fetchWebLiveRank();
   if (!Native || Rank.loading || !App.days.length) return;
   const batches = []; let cur = [];
   const otcLast = App.otc[Object.keys(App.otc).sort().pop()] || {};   // 上櫃代號取最近一天的上櫃收盤檔
@@ -985,8 +1005,9 @@ function renderRank() {
   if (!App.days.length) return empty('還沒有收盤資料，請先到「每日建議」按「更新資料」。');
   const last = App.dates[App.dates.length - 1], ws = weekStart(last);
   const chip = (act, v, on, label) => `<button class="${on ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`;
+  if (!HAS_LIVE && Rank.mode === 'live') Rank.mode = 'day';
   let h = `<section class="card"><div class="chips">
-      ${Native ? chip('rankMode', 'live', Rank.mode === 'live', '即時') : ''}
+      ${HAS_LIVE ? chip('rankMode', 'live', Rank.mode === 'live', '即時') : ''}
       ${chip('rankMode', 'day', Rank.mode === 'day', `收盤 ${last.slice(5)}`)}
       ${chip('rankMode', 'week', Rank.mode === 'week', `本週 ${ws.slice(5)}～${last.slice(5)}`)}
     </div><div class="chips">
@@ -998,15 +1019,20 @@ function renderRank() {
   let rows = null, note = '';
   if (Rank.mode === 'live') {
     const L = Rank.live;
-    if (Rank.loading) h += `<div class="small muted">讀取即時報價 ${Rank.done}/${Rank.total}…</div><div class="status"><div class="bar"><i style="width:${Math.round(Rank.done / (Rank.total || 1) * 100)}%"></i></div></div>`;
+    if (Rank.loading && !L) h += `<div class="small muted">讀取即時報價 ${Rank.done}/${Rank.total}…</div><div class="status"><div class="bar"><i style="width:${Math.round(Rank.done / (Rank.total || 1) * 100)}%"></i></div></div>`;
     if (L) {
       rows = L.rows;
       const today = ymd(new Date());
-      note = L.date && L.date !== today ? `證交所最新報價是 ${L.date} ${L.time}（今天還沒開盤或休市）` :
+      note = L.date && L.date !== today ? `最新報價是 ${L.date} ${L.time}（今天還沒開盤或休市）` :
         `報價時間 ${L.time}${inSession() ? '・盤中每分鐘自動更新' : '・已收盤'}`;
+      if (L.fromPc) {
+        note += '・電腦每 2 分鐘上傳，約晚 2～5 分鐘';
+        const age = (Date.now() - new Date(L.uploaded).getTime()) / 60000;
+        if (L.date === today && inSession() && age > 8) h += `<div class="err">電腦上次上傳是 ${L.uploaded.slice(11, 16)}，可能沒開機或沒連網，排行不是最新的。</div>`;
+      }
     }
     if (L && !L.rows.some(r => r.otc)) note += '・還沒有上櫃代號清單，先只排上市';
-    h += `<div class="row between"><span class="muted small">${note || '證交所報價約有 5 秒延遲'}</span>
+    h += `<div class="row between"><span class="muted small">${note || (Native ? '證交所報價約有 5 秒延遲' : '')}</span>
       <button class="btn-sm" data-act="rankRefresh" ${Rank.loading ? 'disabled' : ''}>重新整理</button></div>`;
     if (Rank.err) h += `<div class="err">${esc(Rank.err)}</div>`;
   } else {
@@ -1014,7 +1040,6 @@ function renderRank() {
     note = Rank.mode === 'day' ? `${last} 收盤` : `${ws} 到 ${last} 累計・漲跌是本週以來`;
     h += `<div class="muted small">${note}</div>`;
     if (rows.otcMissing) h += `<div class="muted small warn-text">上櫃資料缺 ${rows.otcMissing} 天${Native ? '（按「每日建議」的更新資料補抓）' : '（等電腦下次上傳）'}，上櫃排行可能不完整。</div>`;
-    if (!Native) h += `<div class="muted small">即時排行只有 Android App 有（證交所即時報價不開放網頁讀取）。</div>`;
   }
   h += '</section>';
   if (!rows) return h + (Rank.loading ? '' : empty('按「重新整理」讀取即時排行。'));
@@ -1033,7 +1058,7 @@ function renderRank() {
 
 // 排行分頁開著、在盤中，就每分鐘重抓一次即時報價
 function rankAuto() {
-  const want = Native && App.tab === 'rank' && Rank.mode === 'live';
+  const want = HAS_LIVE && App.tab === 'rank' && Rank.mode === 'live';
   if (want && !Rank.timer) Rank.timer = setInterval(() => { if (inSession() && !document.hidden) fetchLiveRank(); }, 60000);
   if (!want && Rank.timer) { clearInterval(Rank.timer); Rank.timer = null; }
   // 失敗後不馬上重試（至少隔 1 分鐘），免得一直打證交所
@@ -1073,7 +1098,10 @@ function renderSettings() {
       <button class="btn wide" data-act="otaCheck">檢查更新</button>
       <p class="muted small">${v.configured ? '每次打開 App 會自動檢查。畫面和功能的更新不用重新安裝；主程式更新需要在系統的安裝畫面按確認。' : '這個 APK 建置時還沒有設定網站，沒有 OTA 更新功能。'}</p></section>`;
   })()}
-  ${IS_WEB && !isStandalone() ? `<section class="card warn"><b>建議加到主畫面</b><p class="small">在 Safari 按下方「分享」→「加入主畫面」，之後從主畫面圖示打開。
+  ${IS_WEB ? `<section class="card"><h3 class="sec0">Android App</h3>
+    <p class="small">Android 手機可以安裝 App 版：即時排行直接向證交所抓（幾秒延遲），還有每日提醒，之後也會自動更新。</p>
+    <a class="btn wide filebtn" href="android.html">下載 Android App</a></section>` : ''}
+  ${IS_WEB && !isStandalone() && !IS_ANDROID_BROWSER ? `<section class="card warn"><b>建議加到主畫面</b><p class="small">在 Safari 按下方「分享」→「加入主畫面」，之後從主畫面圖示打開。
     直接在 Safari 裡使用的話，太久沒開時 Safari 可能會清掉這個網站的資料（包括我的帳戶），加到主畫面就不會。</p></section>` : ''}
 
   <section class="card"><h3 class="sec0">資料</h3>
@@ -1324,6 +1352,7 @@ document.addEventListener('click', e => {
     case 'otaCheck': if (Native && Native.checkUpdate) { Native.checkUpdate(); toast('檢查更新中…'); } break;
     case 'otaApply': if (Native && Native.applyWebUpdate) Native.applyWebUpdate(); break;
     case 'otaInstall': if (Native && Native.installApk) Native.installApk(); break;
+    case 'getApk': location.href = 'android.html'; break;
     case 'exportBackup': exportBackup(); break;
     case 'importBackup': openImport(); break;
     case 'saveSim': {
@@ -1434,6 +1463,7 @@ window.__otaEvent = ev => {
   if (App.tab === 'settings' && ev.manual) render();
 };
 
+const IS_ANDROID_BROWSER = IS_WEB && /Android/i.test(navigator.userAgent);
 const isStandalone = () => window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
 
 // ============================================================ 啟動
@@ -1452,6 +1482,7 @@ async function boot() {
   runDCA();
   render();
   if (Native && Native.bootOk) Native.bootOk();   // 告訴 OTA 這個版本能正常開機
+  if (IS_ANDROID_BROWSER) otaBanner('這支 Android 手機可以安裝 App 版（即時排行更快）', 'getApk', '下載');
   if (Native && Native.setReminder) Native.setReminder(App.settings.reminder.h, App.settings.reminder.m, App.settings.reminder.on);
   const last = App.dates[App.dates.length - 1];
   if ((Native || IS_WEB) && (!last || last < lastExpectedTradingDay())) syncData();
