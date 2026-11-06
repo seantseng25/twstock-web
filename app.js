@@ -87,12 +87,12 @@ const money = x => (x == null || !isFinite(x) ? '—' : Math.round(x).toLocaleSt
 const px = x => (x == null || !isFinite(x) ? '—' : x >= 1000 ? x.toFixed(0) : x.toFixed(2));
 const ud = x => (x > 0 ? 'up' : x < 0 ? 'down' : '');
 const signMoney = x => (x > 0 ? '+' : x < 0 ? '−' : '') + money(Math.abs(x));
-const nm = c => App.names[c] || c;
+const nm = c => App.names[c] || App.otcNames[c] || c;
 
 // ============================================================ 狀態
 const App = {
   tab: 'suggest', names: {}, days: [], dates: [], funds: [], sim: null, viewDate: null,
-  divs: {}, divList: [], divNext: [],
+  divs: {}, divList: [], divNext: [], otc: {}, otcNames: {},
   settings: null, my: null, busy: false, charts: {}, sheet: null, stmtMonth: 'all',
 };
 const SETTINGS_DEFAULT = { startDate: null, capital: 1000000, exitDays: 1, reminder: { on: true, h: 17, m: 30 } };
@@ -195,8 +195,15 @@ function idxOnOrBefore(date) {
   while (lo <= hi) { const mid = (lo + hi) >> 1; if (App.dates[mid] <= date) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
   return ans;
 }
+// 第 i 個交易日的收盤價：上市看 App.days，上櫃看 App.otc
+function closeAt(i, code) {
+  const q = App.days[i].q[code];
+  if (q) return q[3];
+  const o = App.otc[App.dates[i]]?.[code];
+  return o && o.close > 0 ? o.close : null;
+}
 function priceOn(code, date) {
-  for (let i = idxOnOrBefore(date); i >= 0; i--) { const q = App.days[i].q[code]; if (q) return { price: q[3], date: App.dates[i] }; }
+  for (let i = idxOnOrBefore(date); i >= 0; i--) { const p = closeAt(i, code); if (p) return { price: p, date: App.dates[i] }; }
   return null;
 }
 
@@ -312,17 +319,36 @@ async function mergeServerData() {
   return missing.length;
 }
 
-// 上櫃收盤（櫃買中心）：只給成交量排行用，保留最近 OTC_DAYS 個交易日。
-// Android 直接向櫃買中心下載；網頁版（櫃買中心不開放跨站讀取）靠電腦上傳到網站的 o_ 檔
-const OTC_DAYS = 10;
+// 上櫃收盤（櫃買中心）：成交量排行、帳戶裡上櫃持股的價格都用這份，和上市資料保留一樣多天（策略選股只用上市）。
+// 櫃買中心的資料從 2007-07-02 開始。網頁版（櫃買中心不開放跨站讀取）靠電腦上傳到網站的 o_ 檔；
+// Android 先從網站抓電腦整理好的檔（快），網站沒有的才一天一天向櫃買中心下載
+const OTC_FIRST = '2007-07-02';
 async function syncOtc() {
-  const keep = new Set(App.dates.slice(-OTC_DAYS));
-  for (const d of keep) {
-    if (Store.read('o_' + d + '.csv') != null) continue;
+  const keep = new Set(App.dates.filter(d => d >= OTC_FIRST));
+  const none = new Set(JSON.parse(Store.read('otc_none.json') || '[]'));
+  let todo = [...keep].filter(d => !none.has(d) && Store.read('o_' + d + '.csv') == null);
+  if (todo.length) {
+    try {
+      const base = JSON.parse(Store.asset('ota.json') || '{}').base;
+      const files = new Set(JSON.parse(await httpGet(base + 'data/index.json?t=' + Date.now())).files || []);
+      const fromSite = todo.filter(d => files.has('o_' + d + '.csv'));
+      for (let i = 0; i < fromSite.length; i += 6) {
+        setStatus(`下載上櫃收盤（${i}/${fromSite.length}）…`, i / fromSite.length);
+        await Promise.all(fromSite.slice(i, i + 6).map(async d => { Store.write('o_' + d + '.csv', await httpGet(base + 'data/o_' + d + '.csv')); }));
+      }
+      todo = todo.filter(d => Store.read('o_' + d + '.csv') == null);
+    } catch (e) { /* 網站連不到就全部向櫃買中心抓 */ }
+  }
+  let k = 0;
+  for (const d of todo.reverse()) {   // 新的先抓
+    setStatus(`下載 ${d} 上櫃收盤（${++k}/${todo.length}）…`, k / todo.length);
     try {
       const j = JSON.parse(await httpGet(`https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date=${d.replace(/-/g, '%2F')}&type=EW&response=json`));
       const t = (j.tables || [])[0], want = `${+d.slice(0, 4) - 1911}/${d.slice(5).replace('-', '/')}`;
-      if (!t || t.date !== want || !(t.data || []).length) continue;
+      if (!t || t.date !== want || !(t.data || []).length) {
+        if (t && t.date === want && d < ymd(new Date())) none.add(d);   // 那天櫃買中心確定沒資料，之後不再抓
+        await sleep(1500); continue;
+      }
       const n = s => { const x = parseFloat(String(s).replace(/,/g, '')); return isFinite(x) ? x : null; };
       const lines = ['#OTC,' + d, 'Code,Name,Close,Prev,Volume,Value'];
       // 欄位：代號、名稱、收盤、漲跌、開盤、最高、最低、成交股數、成交金額…
@@ -335,18 +361,21 @@ async function syncOtc() {
       await sleep(1500);
     } catch (e) { /* 這天抓不到就算了，下次更新再補 */ }
   }
+  Store.write('otc_none.json', JSON.stringify([...none]));
   for (const f of Store.list('o_')) if (!keep.has(f.slice(2, 12))) Store.del(f);
   loadOtc();
 }
 function loadOtc() {
-  App.otc = {};
-  for (const d of App.dates.slice(-OTC_DAYS)) {
+  App.otc = {}; App.otcNames = {};
+  for (const d of App.dates) {
+    if (d < OTC_FIRST) continue;
     const s = Store.read('o_' + d + '.csv');
     if (!s) continue;
     const m = {};
     for (const ln of s.split(/\r?\n/).slice(2)) {
       const p = ln.split(','); if (p.length < 6) continue;
       m[p[0]] = { name: p[1], close: +p[2], prev: p[3] === '' ? null : +p[3], vol: +p[4], value: p[5] === '' ? null : +p[5] };
+      App.otcNames[p[0]] = p[1];   // 日期由舊到新，留下最新的名稱
     }
     App.otc[d] = m;
   }
@@ -383,7 +412,7 @@ async function syncData(opts = {}) {
     }
     Store.write('no_trade.json', JSON.stringify([...noTrade]));
     loadData();
-    if (Native) { setStatus('更新上櫃收盤（成交量排行用）…', k / total); await syncOtc(); }
+    if (Native) { setStatus('更新上櫃收盤…', k / total); await syncOtc(); }
     // 網頁版沒辦法直接讀證交所 openapi（跨網站限制），基本面只靠電腦上傳
     if (Native) {
       setStatus('更新基本面資料…', k / total);
@@ -457,9 +486,9 @@ function myState() {
     const h = st.hold[code];
     const p = lastDate && priceOn(code, lastDate);
     const price = p ? p.price : st.lastPx[code];
-    const i = App.dates.length - 2, prevQ = i >= 0 ? App.days[i].q[code] : null;
+    const i = App.dates.length - 2, prev = i >= 0 ? closeAt(i, code) : null;
     const value = h.shares * price;
-    mv += value; cost += h.cost; mvPrev += h.shares * (prevQ ? prevQ[3] : price);
+    mv += value; cost += h.cost; mvPrev += h.shares * (prev || price);
     list.push({ code, shares: h.shares, avg: h.cost / h.shares, cost: h.cost, price, value, pnl: value - h.cost });
   }
   list.sort((a, b) => b.value - a.value);
@@ -1074,9 +1103,27 @@ const d8 = s => (s && s.length === 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.sl
 function idxFromPc(j) {
   if (!j || !j.idx) return;
   const one = a => (a ? { p: a[0], y: a[1], h: a[2], l: a[3], t: a[4] } : null);
-  Idx.data = { tse: one(j.idx.tse), otc: one(j.idx.otc), date: j.date, uploaded: j.at, fromPc: true };
+  Idx.data = { tse: one(j.idx.tse), otc: one(j.idx.otc), date: j.date, uploaded: j.at, fromPc: true, final: !!j.idx.final };
   Idx.at = Date.now();
 }
+const nowMin = () => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); };
+// 收盤後即時報價常常停在 13:30 以前（例如 2026-11-06 停在 13:19:50，和正式收盤差 10 點），
+// 13:30 以後改查證交所、櫃買中心公布的正式收盤（約 13:40 以後才有）
+async function fetchOfficialClose(date) {
+  const r = {}, n = App.days.length;
+  if (App.dates[n - 1] === date) r.tse = App.days[n - 1].index;
+  if (!r.tse) try {
+    const j = JSON.parse(await httpGet(`https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${date.replace(/-/g, '')}&type=IND&response=json`));
+    for (const tb of j.tables || []) for (const row of tb.data || []) if (row[0] === '發行量加權股價指數') r.tse = num(row[1]);
+  } catch (e) { /* 還沒公布 */ }
+  try {
+    const j = JSON.parse(await httpGet(`https://www.tpex.org.tw/www/zh-tw/indexInfo/inx?date=${date.replace(/-/g, '%2F')}&response=json`));
+    const row = ((j.tables || [])[0]?.data || []).find(x => x[0] === date.replace(/-/g, '/'));   // 欄位：日期、開、高、低、收、漲跌
+    if (row) r.otc = num(row[4]);
+  } catch (e) { /* 還沒公布 */ }
+  return r;
+}
+const needFinal = d => d && !d.final && d.date === ymd(new Date()) && nowMin() >= 13 * 60 + 30 && ((d.tse && d.tse.t) || '') < '13:30:00';
 async function fetchIndex() {
   if (Idx.busy) return;
   Idx.busy = true;
@@ -1087,6 +1134,12 @@ async function fetchIndex() {
       for (const m of j.msgArray || []) {
         d[m.ex] = { p: posNum(m.z), y: posNum(m.y), h: posNum(m.h), l: posNum(m.l), t: m.t || '' };
         d.date = d8(m.d);
+      }
+      if (needFinal(d)) {
+        const off = Idx.official && Idx.official.date === d.date ? Idx.official : Object.assign(await fetchOfficialClose(d.date), { date: d.date });
+        if (off.tse && off.otc) Idx.official = off;
+        for (const k of ['tse', 'otc']) if (off[k] && d[k]) { d[k].p = off[k]; d[k].t = '13:30:00'; }
+        d.final = !!(off.tse && off.otc);
       }
       if (d.tse || d.otc) { Idx.data = d; Idx.at = Date.now(); }
     } else if (liveRankUrl()) idxFromPc(JSON.parse(await httpGet(liveRankUrl() + '?t=' + Date.now())));
@@ -1113,6 +1166,8 @@ function renderIdx() {
   let note;
   if (D.closeOnly) note = `${D.date} 收盤`;
   else if (D.date !== today) note = `${D.date} 收盤（今天還沒開盤或休市）`;
+  else if (D.final) note = '今日正式收盤';
+  else if (nowMin() >= 13 * 60 + 30 && t < '13:30:00') note = `最後報價 ${t}・正式收盤公布後自動更新`;
   else if (D.fromPc) note = `${t}・電腦每 2 分鐘上傳，約晚 2～5 分鐘`;
   else note = `${t}${inSession() ? '・盤中每 20 秒更新' : '・今日收盤'}`;
   el.innerHTML = cell('加權指數', D.tse) + cell('櫃買指數', D.otc) + `<div class="t">${esc(note)}</div>`;
@@ -1120,7 +1175,11 @@ function renderIdx() {
 }
 function startIndexTimer() {
   fetchIndex();
-  setInterval(() => { if (!document.hidden && (inSession() || !Idx.data)) fetchIndex(); }, Native ? 20000 : 60000);
+  setInterval(() => {
+    // 收盤後還沒拿到正式收盤：每分鐘再查一次，到 15:00 為止
+    const waitFinal = Idx.data && !Idx.data.final && Idx.data.date === ymd(new Date()) && nowMin() < 15 * 60 && Date.now() - Idx.at > 55000;
+    if (!document.hidden && (inSession() || !Idx.data || waitFinal)) fetchIndex();
+  }, Native ? 20000 : 60000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden && Date.now() - Idx.at > 15000) fetchIndex(); });
 }
 
@@ -1291,11 +1350,6 @@ function wireStockSearch() {
     if (App.sheet && App.sheet.onInput) App.sheet.onInput();
   });
 }
-// 上櫃股票的收盤價（只有最近 OTC_DAYS 天）
-function otcPriceOn(code, date) {
-  for (const d of Object.keys(App.otc || {}).sort().reverse()) if (d <= date && App.otc[d][code]?.close > 0) return { price: App.otc[d][code].close, date: d };
-  return null;
-}
 const defaultDate = () => App.dates[App.dates.length - 1] || ymd(new Date());
 
 function openCash(type) {
@@ -1338,7 +1392,7 @@ function openTrade(side, code, price) {
     const key = c + '|' + date;
     if (key !== lastKey && known && date) {   // 換了股票或日期才自動帶入當天收盤價（第一次開啟時保留傳進來的價格）
       lastKey = key;
-      const p = priceOn(c, date) || otcPriceOn(c, date);
+      const p = priceOn(c, date);
       if (p && !(first && price)) $('#fPx').value = p.price;
       if (side === 'SELL' && st.hold[c]) $('#fSh').value = st.hold[c].shares;
       first = false;
@@ -1599,7 +1653,11 @@ async function boot() {
     if ((Native || IS_WEB) && !App.divList.length && last) {
       syncDividends().then(() => { computeSim(); render(); }).catch(() => {}).finally(() => setStatus(null));
     }
-    if (Native && last && !App.otc[last]) syncOtc().then(() => { if (App.tab === 'rank') render(); });
+    // 上櫃收盤缺天（例如剛更新到保留完整歷史的版本）：背景補齊
+    if (Native && last && App.dates.filter(d => d >= OTC_FIRST && !App.otc[d]).length > 5 && !App.busy) {
+      App.busy = true;
+      syncOtc().catch(() => {}).finally(() => { App.busy = false; setStatus(null); render(); });
+    }
   }
   if (IS_WEB && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
