@@ -748,7 +748,7 @@ function renderLongBacktest() {
     ...(E5 ? [{ name: '0050（含息）', color: 'var(--c3)', data: S.etf.map(v => v - 1) }] : []),
     { name: '加權指數（不含息）', color: 'var(--muted)', data: S.index.map(v => v / i0 - 1), dash: true },
   ] };
-  const pick = bt.runs.length > 1 ? `<select data-change="btRun">${bt.runs.map((r, i) => `<option value="${i}" ${i === k ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select>` : `<p class="small">${esc(R.label)}</p>`;
+  const pick = bt.runs.length > 1 ? `<select class="pick" data-change="btRun">${bt.runs.map((r, i) => `<option value="${i}" ${i === k ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select><div class="small" style="margin-top:6px">${esc(R.label)}</div>` : `<p class="small">${esc(R.label)}</p>`;   // 選單太窄會截掉，下面再完整寫一次
   const etfTd = x => (E5 ? `<td class="num ${ud(x)}">${fmtPct(x, 1)}</td>` : '');
   const yrows = R.yearly.slice().reverse().map(y => `<tr><td>${y.year}</td><td class="num ${ud(y.acct)}">${fmtPct(y.acct, 1)}</td>${etfTd(y.etf)}<td class="num ${ud(y.index)}">${fmtPct(y.index, 1)}</td>
     <td class="num ${ud(y.Core)}">${fmtPct(y.Core, 1)}</td><td class="num ${ud(y.Value)}">${fmtPct(y.Value, 1)}</td><td class="num ${ud(y.Pead)}">${fmtPct(y.Pead, 1)}</td></tr>`).join('');

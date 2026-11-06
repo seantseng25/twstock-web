@@ -11,7 +11,12 @@
     --bull-bg: #3a1c1e; --bear-bg: #14301f; --flat-bg: #3a2f17; --na-bg: #23262d;
   }
 }
+/* 讓下拉選單、日期選擇等系統元件跟著深色／淺色模式，不會出現白底白字 */
+:root { color-scheme: light dark; }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px; }
+option { background: var(--card); color: var(--text); }
+select.pick { width: 100%; font-weight: 600; border-color: var(--accent); }
 html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Noto Sans TC", sans-serif; }
 body { padding-bottom: calc(var(--tab-h) + env(safe-area-inset-bottom)); overflow-x: hidden; }
 button, input, select, textarea { font: inherit; color: inherit; }
