@@ -120,6 +120,7 @@ function loadData() {
   App.days = App.dates.map(d => parseDayCsv(d, readCsv('d_', d), App.names));
   App.funds = listByPrefix('f_').map(d => Object.assign(parseFundCsv(readCsv('f_', d)), { date: d }));
   loadDivs();
+  loadOtc();
   try { App.bt = JSON.parse(Store.read('backtest.json') ?? Store.asset('seed/backtest.json') ?? 'null'); } catch (e) { App.bt = null; }
 }
 
@@ -299,7 +300,7 @@ async function mergeServerData() {
   if (!IS_WEB) return 0;
   let idx;
   try { idx = JSON.parse(await httpGet('data/index.json?t=' + Date.now())); } catch (e) { return 0; }
-  const missing = (idx.files || []).filter(f => /^[df]_\d{4}-\d{2}-\d{2}\.csv$/.test(f) && Store.read(f) == null);
+  const missing = (idx.files || []).filter(f => /^[dfo]_\d{4}-\d{2}-\d{2}\.csv$/.test(f) && Store.read(f) == null);
   if ((idx.files || []).includes('div.csv') && Store.read('div.csv') == null) missing.push('div.csv');
   const btVer = String(idx.backtest || '');
   if ((idx.files || []).includes('backtest.json') && Store.read('backtest_ver.txt') !== btVer) missing.push('backtest.json');
@@ -309,6 +310,46 @@ async function mergeServerData() {
   }
   if (missing.includes('backtest.json')) Store.write('backtest_ver.txt', btVer);
   return missing.length;
+}
+
+// 上櫃收盤（櫃買中心）：只給成交量排行用，保留最近 OTC_DAYS 個交易日。
+// Android 直接向櫃買中心下載；網頁版（櫃買中心不開放跨站讀取）靠電腦上傳到網站的 o_ 檔
+const OTC_DAYS = 10;
+async function syncOtc() {
+  const keep = new Set(App.dates.slice(-OTC_DAYS));
+  for (const d of keep) {
+    if (Store.read('o_' + d + '.csv') != null) continue;
+    try {
+      const j = JSON.parse(await httpGet(`https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date=${d.replace(/-/g, '%2F')}&type=EW&response=json`));
+      const t = (j.tables || [])[0], want = `${+d.slice(0, 4) - 1911}/${d.slice(5).replace('-', '/')}`;
+      if (!t || t.date !== want || !(t.data || []).length) continue;
+      const n = s => { const x = parseFloat(String(s).replace(/,/g, '')); return isFinite(x) ? x : null; };
+      const lines = ['#OTC,' + d, 'Code,Name,Close,Prev,Volume,Value'];
+      // 欄位：代號、名稱、收盤、漲跌、開盤、最高、最低、成交股數、成交金額…
+      for (const r of t.data) {
+        const c = n(r[2]), ch = n(r[3]), v = n(r[7]);
+        if (!c || v == null) continue;
+        lines.push([String(r[0]).trim(), String(r[1]).trim().replace(/,/g, ' '), c, ch != null ? +(c - ch).toFixed(2) : '', v, n(r[8]) ?? ''].join(','));
+      }
+      Store.write('o_' + d + '.csv', lines.join('\n'));
+      await sleep(1500);
+    } catch (e) { /* 這天抓不到就算了，下次更新再補 */ }
+  }
+  for (const f of Store.list('o_')) if (!keep.has(f.slice(2, 12))) Store.del(f);
+  loadOtc();
+}
+function loadOtc() {
+  App.otc = {};
+  for (const d of App.dates.slice(-OTC_DAYS)) {
+    const s = Store.read('o_' + d + '.csv');
+    if (!s) continue;
+    const m = {};
+    for (const ln of s.split(/\r?\n/).slice(2)) {
+      const p = ln.split(','); if (p.length < 6) continue;
+      m[p[0]] = { name: p[1], close: +p[2], prev: p[3] === '' ? null : +p[3], vol: +p[4], value: p[5] === '' ? null : +p[5] };
+    }
+    App.otc[d] = m;
+  }
 }
 
 function lastExpectedTradingDay() {
@@ -342,6 +383,7 @@ async function syncData(opts = {}) {
     }
     Store.write('no_trade.json', JSON.stringify([...noTrade]));
     loadData();
+    if (Native) { setStatus('更新上櫃收盤（成交量排行用）…', k / total); await syncOtc(); }
     // 網頁版沒辦法直接讀證交所 openapi（跨網站限制），基本面只靠電腦上傳
     if (Native) {
       setStatus('更新基本面資料…', k / total);
@@ -629,15 +671,22 @@ function renderLongBacktest() {
   const bt = App.bt;
   if (!bt || !bt.runs || !bt.runs.length) return '';
   const k = Math.min(App.btRun || 0, bt.runs.length - 1), R = bt.runs[k], S = R.series, i0 = S.index[0];
+  const E5 = R.etf && S.etf ? R.etf : null;   // 舊版 backtest.json 沒有 0050 比較
   App.charts.long = { labels: S.dates, pct: true, series: [
     { name: '模擬帳戶', color: 'var(--accent)', data: S.acct.map(v => v / R.capital - 1) },
+    ...(E5 ? [{ name: '0050（含息）', color: 'var(--c3)', data: S.etf.map(v => v - 1) }] : []),
     { name: '加權指數（不含息）', color: 'var(--muted)', data: S.index.map(v => v / i0 - 1), dash: true },
   ] };
   const pick = bt.runs.length > 1 ? `<select data-change="btRun">${bt.runs.map((r, i) => `<option value="${i}" ${i === k ? 'selected' : ''}>${esc(r.label)}</option>`).join('')}</select>` : `<p class="small">${esc(R.label)}</p>`;
-  const yrows = R.yearly.slice().reverse().map(y => `<tr><td>${y.year}</td><td class="num ${ud(y.acct)}">${fmtPct(y.acct, 1)}</td><td class="num ${ud(y.index)}">${fmtPct(y.index, 1)}</td>
+  const etfTd = x => (E5 ? `<td class="num ${ud(x)}">${fmtPct(x, 1)}</td>` : '');
+  const yrows = R.yearly.slice().reverse().map(y => `<tr><td>${y.year}</td><td class="num ${ud(y.acct)}">${fmtPct(y.acct, 1)}</td>${etfTd(y.etf)}<td class="num ${ud(y.index)}">${fmtPct(y.index, 1)}</td>
     <td class="num ${ud(y.Core)}">${fmtPct(y.Core, 1)}</td><td class="num ${ud(y.Value)}">${fmtPct(y.Value, 1)}</td><td class="num ${ud(y.Pead)}">${fmtPct(y.Pead, 1)}</td></tr>`).join('');
   const crows = R.crises.map(c => `<tr><td>${esc(c.name)}<div class="muted small">${c.from} ~ ${c.to}</div></td>
-    <td class="num ${ud(c.acct)}">${fmtPct(c.acct, 1)}</td><td class="num ${ud(c.index)}">${fmtPct(c.index, 1)}</td></tr>`).join('');
+    <td class="num ${ud(c.acct)}">${fmtPct(c.acct, 1)}</td>${etfTd(c.etf)}<td class="num ${ud(c.index)}">${fmtPct(c.index, 1)}</td></tr>`).join('');
+  const beat = E5 ? R.yearly.filter(y => y.acct > y.etf).length : 0;
+  const vs = E5 ? `<div class="calc"><div class="row between"><span>同期 100 萬買 0050 放著（股息再投入）</span><b class="${ud(E5.ret)}">${money(E5.final)}</b></div>
+    <div class="small muted">年化 ${fmtPct(E5.cagr)}・最大回落 ${(E5.mdd * 100).toFixed(1)}%</div>
+    <div class="small">策略比 0050 <b class="${ud(R.final - E5.final)}">${R.final >= E5.final ? '多' : '少'} ${money(Math.abs(R.final - E5.final))} 元</b>；${R.yearly.length} 年中有 ${beat} 年贏 0050</div></div>` : '';
   return `<section class="card"><h3 class="sec0">長期回測（${R.start.slice(0, 4)} ~ ${R.end.slice(0, 4)}）</h3>${pick}
     <div class="muted small" style="margin-top:8px">100 萬照策略自動買賣 ${R.days.toLocaleString()} 個交易日</div>
     <div class="hero ${ud(R.acctRet)}">${money(R.final)}</div>
@@ -649,12 +698,12 @@ function renderLongBacktest() {
       <div><div class="muted small">賣出筆數</div><b>${R.trades.toLocaleString()}</b></div>
       <div><div class="muted small">勝率</div><b>${R.winRate != null ? (R.winRate * 100).toFixed(1) + '%' : '—'}</b></div>
       <div><div class="muted small">三組合計</div><b class="${ud(R.combRet)}">${fmtPct(R.combRet, 0)}</b></div>
-    </div></section>
+    </div>${vs}</section>
   <section class="card">${chartBlock('long')}</section>
-  ${crows ? `<section class="card"><h3 class="sec0">股災和大多頭時的表現</h3><table class="tbl"><thead><tr><th>期間</th><th class="num">帳戶</th><th class="num">大盤</th></tr></thead><tbody>${crows}</tbody></table></section>` : ''}
-  <details class="card"><summary>逐年報酬</summary><table class="tbl"><thead><tr><th>年</th><th class="num">帳戶</th><th class="num">大盤</th><th class="num">核心</th><th class="num">價值</th><th class="num">PEAD</th></tr></thead><tbody>${yrows}</tbody></table>
+  ${crows ? `<section class="card"><h3 class="sec0">股災和大多頭時的表現</h3><table class="tbl"><thead><tr><th>期間</th><th class="num">帳戶</th>${E5 ? '<th class="num">0050</th>' : ''}<th class="num">大盤</th></tr></thead><tbody>${crows}</tbody></table></section>` : ''}
+  <details class="card"><summary>逐年報酬</summary><table class="tbl"><thead><tr><th>年</th><th class="num">帳戶</th>${E5 ? '<th class="num">0050</th>' : ''}<th class="num">大盤</th><th class="num">核心</th><th class="num">價值</th><th class="num">PEAD</th></tr></thead><tbody>${yrows}</tbody></table>
     <p class="muted small">核心組、PEAD 組要有月營收資料（2010 年起）才會選股。</p></details>
-  <p class="muted small">長期回測由電腦用證交所 ${bt.dataFrom} 起的完整歷史計算，選股只用當時已公布的營收和淨值比；大盤用不含息的加權指數。過去績效不代表未來。</p>
+  <p class="muted small">長期回測由電腦用證交所 ${bt.dataFrom} 起的完整歷史計算，選股只用當時已公布的營收和淨值比；大盤用不含息的加權指數，0050 是從第一天買進放著、股息再投入的含息報酬（沒扣手續費）。過去績效不代表未來。</p>
   <h3 class="sec">近期模擬（手機計算）</h3>`;
 }
 
@@ -857,7 +906,7 @@ function stmtRow(r) {
 // 即時：證交所即時報價（mis.twse.com.tw）沒有排行榜 API，所以把所有上市股票分批查一次再自己排序；
 //       這個網址不開放網頁跨站讀取，只有 Android App（原生連線）能用。
 // 收盤／本週：用已下載的每日收盤資料計算，網頁版也能用。
-const Rank = { mode: Native ? 'live' : 'day', by: 'vol', etf: true, live: null, loading: false, done: 0, total: 0, err: '', timer: null };
+const Rank = { mode: Native ? 'live' : 'day', by: 'vol', etf: true, mkt: 'all', live: null, loading: false, done: 0, total: 0, err: '', timer: null };
 const RANK_TOP = 30;
 const isEtf = c => c.startsWith('00');
 const posNum = s => { const x = parseFloat(s); return isFinite(x) && x > 0 ? x : null; };
@@ -867,8 +916,10 @@ const inSession = () => { const d = new Date(), w = d.getDay(), m = d.getHours()
 async function fetchLiveRank() {
   if (!Native || Rank.loading || !App.days.length) return;
   const batches = []; let cur = [];
-  for (const c of Object.keys(App.days[App.days.length - 1].q)) {
-    cur.push(`tse_${c}.tw`);
+  const otcLast = App.otc[Object.keys(App.otc).sort().pop()] || {};   // 上櫃代號取最近一天的上櫃收盤檔
+  const keys = [...Object.keys(App.days[App.days.length - 1].q).map(c => `tse_${c}.tw`), ...Object.keys(otcLast).map(c => `otc_${c}.tw`)];
+  for (const k of keys) {
+    cur.push(k);
     if (cur.join('|').length > 1200) { batches.push(cur); cur = []; }   // 網址太長證交所會回「參數不足」
   }
   if (cur.length) batches.push(cur);
@@ -883,7 +934,7 @@ async function fetchLiveRank() {
         if (!isFinite(lots)) continue;
         // z 是最新成交價；剛好沒有新成交時是 "-"，改用最後一筆成交或最佳買價
         const p = posNum(m.z) ?? posNum(m.trade && m.trade.z) ?? posNum(String(m.b || '').split('_')[0]);
-        rows.push({ code: m.c, name: m.n, price: p, chg: p && y ? p / y - 1 : null, lots, value: p ? lots * 1000 * p : 0 });
+        rows.push({ code: m.c, name: m.n, otc: m.ex === 'otc', price: p, chg: p && y ? p / y - 1 : null, lots, value: p ? lots * 1000 * p : 0 });
         if ((m.d || '') + (m.t || '') > date + time) { date = m.d || ''; time = m.t || ''; }
       }
     } catch (e) { fail++; }
@@ -909,7 +960,20 @@ function closeRank(from, end) {
       a.lots += q[4] / 1000; a.value += q[4] * q[3]; if (q[3] > 0) a.price = q[3];
     }
   }
-  return Object.values(acc).map(a => Object.assign(a, { chg: prev && prev[a.code] && prev[a.code][3] > 0 && a.price ? a.price / prev[a.code][3] - 1 : null }));
+  const out = Object.values(acc).map(a => Object.assign(a, { chg: prev && prev[a.code] && prev[a.code][3] > 0 && a.price ? a.price / prev[a.code][3] - 1 : null }));
+  // 上櫃：成交金額是櫃買中心的實際數字；漲跌用期間第一天的前一日收盤
+  const oacc = {}; let miss = 0;
+  for (let i = i0; i <= i1; i++) {
+    const m = App.otc[App.dates[i]];
+    if (!m) { miss++; continue; }
+    for (const [c, x] of Object.entries(m)) {
+      const a = oacc[c] || (oacc[c] = { code: c, name: x.name, otc: true, lots: 0, value: 0, price: null, base: x.prev });
+      a.lots += x.vol / 1000; a.value += x.value ?? x.vol * x.close; if (x.close > 0) a.price = x.close;
+    }
+  }
+  for (const a of Object.values(oacc)) out.push(Object.assign(a, { chg: a.base > 0 && a.price ? a.price / a.base - 1 : null }));
+  out.otcMissing = Object.keys(oacc).length ? miss : i1 - i0 + 1;
+  return out;
 }
 // 最新收盤日所在那一週（週一起算）的第一個交易日
 function weekStart(d) {
@@ -928,6 +992,8 @@ function renderRank() {
     </div><div class="chips">
       ${chip('rankBy', 'vol', Rank.by === 'vol', '成交量')}${chip('rankBy', 'val', Rank.by === 'val', '成交值')}
       ${chip('rankEtf', 1, Rank.etf, '含 ETF')}${chip('rankEtf', 0, !Rank.etf, '只看個股')}
+    </div><div class="chips">
+      ${chip('rankMkt', 'all', Rank.mkt === 'all', '上市＋上櫃')}${chip('rankMkt', 'tse', Rank.mkt === 'tse', '上市')}${chip('rankMkt', 'otc', Rank.mkt === 'otc', '上櫃')}
     </div>`;
   let rows = null, note = '';
   if (Rank.mode === 'live') {
@@ -939,26 +1005,29 @@ function renderRank() {
       note = L.date && L.date !== today ? `證交所最新報價是 ${L.date} ${L.time}（今天還沒開盤或休市）` :
         `報價時間 ${L.time}${inSession() ? '・盤中每分鐘自動更新' : '・已收盤'}`;
     }
-    h += `<div class="row between"><span class="muted small">${note || '上市股票（不含上櫃）・證交所報價約有 5 秒延遲'}</span>
+    if (L && !L.rows.some(r => r.otc)) note += '・還沒有上櫃代號清單，先只排上市';
+    h += `<div class="row between"><span class="muted small">${note || '證交所報價約有 5 秒延遲'}</span>
       <button class="btn-sm" data-act="rankRefresh" ${Rank.loading ? 'disabled' : ''}>重新整理</button></div>`;
     if (Rank.err) h += `<div class="err">${esc(Rank.err)}</div>`;
   } else {
     rows = Rank.mode === 'day' ? closeRank(last, last) : closeRank(ws, last);
-    note = Rank.mode === 'day' ? `${last} 收盤・上市股票（不含上櫃）` : `${ws} 到 ${last} 累計・漲跌是本週以來`;
+    note = Rank.mode === 'day' ? `${last} 收盤` : `${ws} 到 ${last} 累計・漲跌是本週以來`;
     h += `<div class="muted small">${note}</div>`;
+    if (rows.otcMissing) h += `<div class="muted small warn-text">上櫃資料缺 ${rows.otcMissing} 天${Native ? '（按「每日建議」的更新資料補抓）' : '（等電腦下次上傳）'}，上櫃排行可能不完整。</div>`;
     if (!Native) h += `<div class="muted small">即時排行只有 Android App 有（證交所即時報價不開放網頁讀取）。</div>`;
   }
   h += '</section>';
   if (!rows) return h + (Rank.loading ? '' : empty('按「重新整理」讀取即時排行。'));
   const key = Rank.by === 'vol' ? 'lots' : 'value';
-  const top = rows.filter(r => r[key] > 0 && (Rank.etf || !isEtf(r.code))).sort((a, b) => b[key] - a[key]).slice(0, RANK_TOP);
+  const top = rows.filter(r => r[key] > 0 && (Rank.etf || !isEtf(r.code)) && (Rank.mkt === 'all' || (Rank.mkt === 'otc') === !!r.otc))
+    .sort((a, b) => b[key] - a[key]).slice(0, RANK_TOP);
   const hold = myState().hold;
   h += `<section class="card"><table class="tbl"><tr><th></th><th>股票</th><th class="num">價格</th><th class="num">${Rank.by === 'vol' ? '張數' : '金額（億）'}</th></tr>
     ${top.map((r, i) => `<tr><td class="muted">${i + 1}</td>
-      <td><b>${esc(r.name || nm(r.code))}</b>${hold[r.code] ? ' <span class="tag">持有</span>' : ''}<div class="code">${esc(r.code)}</div></td>
+      <td><b>${esc(r.name || nm(r.code))}</b>${hold[r.code] ? ' <span class="tag">持有</span>' : ''}<div class="code">${esc(r.code)}${r.otc ? '・上櫃' : ''}</div></td>
       <td class="num">${px(r.price)}<div class="small ${ud(r.chg)}">${fmtPct(r.chg)}</div></td>
       <td class="num">${Rank.by === 'vol' ? money(r.lots) : (r.value / 1e8).toFixed(1)}</td></tr>`).join('')}</table>
-    ${Rank.by === 'val' ? '<p class="muted small">成交值用成交量 × 價格估算。</p>' : ''}</section>`;
+    ${Rank.by === 'val' ? `<p class="muted small">${Rank.mode === 'live' ? '成交值用成交量 × 現價估算。' : '上市成交值用成交量 × 收盤價估算，上櫃是櫃買中心公布的成交金額。'}</p>` : ''}</section>`;
   return h;
 }
 
@@ -1229,6 +1298,7 @@ document.addEventListener('click', e => {
     case 'rankMode': Rank.mode = el.dataset.v; render(); break;
     case 'rankBy': Rank.by = el.dataset.v; render(); break;
     case 'rankEtf': Rank.etf = el.dataset.v === '1'; render(); break;
+    case 'rankMkt': Rank.mkt = el.dataset.v; render(); break;
     case 'rankRefresh': fetchLiveRank(); break;
     case 'older': if (App.dates.length) syncData({ from: addDays(App.dates[0], -92), to: addDays(App.dates[0], -1) }); break;
     case 'closeSheet': closeSheet(); break;
@@ -1385,8 +1455,11 @@ async function boot() {
   if (Native && Native.setReminder) Native.setReminder(App.settings.reminder.h, App.settings.reminder.m, App.settings.reminder.on);
   const last = App.dates[App.dates.length - 1];
   if ((Native || IS_WEB) && (!last || last < lastExpectedTradingDay())) syncData();
-  else if ((Native || IS_WEB) && !App.divList.length && last) {
-    syncDividends().then(() => { computeSim(); render(); }).catch(() => {}).finally(() => setStatus(null));
+  else {
+    if ((Native || IS_WEB) && !App.divList.length && last) {
+      syncDividends().then(() => { computeSim(); render(); }).catch(() => {}).finally(() => setStatus(null));
+    }
+    if (Native && last && !App.otc[last]) syncOtc().then(() => { if (App.tab === 'rank') render(); });
   }
   if (IS_WEB && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
