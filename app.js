@@ -1233,6 +1233,64 @@ function watchQuote(c) {
   for (let i = n - 1; i >= 0; i--) if (closeAt(i, c)) return close(i);
   return { price: null };
 }
+// 分時走勢（Yahoo 每分鐘成交價）：Android 直接查 Yahoo；網頁版讀電腦盤中上傳的 intraday/N.json（依代號最後一個字分 10 份）
+// 統一成 { date, y: 昨收, m: [09:00 起第幾分鐘], p: [價] }，快取 1 分鐘
+const Intra = { c: {}, shard: {} };
+async function loadIntraday(c) {
+  const hit = Intra.c[c];
+  if (hit && Date.now() - hit.at < 60000) return hit.d;
+  let d = null;
+  if (Native) {
+    const j = JSON.parse(await httpGet(`https://query1.finance.yahoo.com/v8/finance/chart/${c}.${isOtcCode(c) ? 'TWO' : 'TW'}?interval=1m&range=1d`));
+    const r = j.chart.result[0], cl = r.indicators.quote[0].close, m = [], p = [];
+    (r.timestamp || []).forEach((t, k) => {
+      if (cl[k] == null) return;
+      const tw = new Date((t + 8 * 3600) * 1000);   // 台灣時間
+      m.push(tw.getUTCHours() * 60 + tw.getUTCMinutes() - 540); p.push(+cl[k].toFixed(2));
+    });
+    const tw = new Date((r.meta.regularMarketTime + 8 * 3600) * 1000);
+    d = { date: tw.toISOString().slice(0, 10), y: r.meta.previousClose || r.meta.chartPreviousClose, m, p };
+  } else {
+    const url = liveRankUrl();
+    if (!url) return null;
+    const n = c.charCodeAt(c.length - 1) % 10, s = Intra.shard[n];
+    const j = s && Date.now() - s.at < 60000 ? s.j : JSON.parse(await httpGet(url.replace(/rank\.json$/, `intraday/${n}.json`) + '?t=' + Date.now()));
+    Intra.shard[n] = { j, at: s && s.j === j ? s.at : Date.now() };
+    const a = j.s[c];
+    if (a) {
+      const m = [], p = []; let mm = 0, pp = 0;
+      for (let k = 1; k + 1 < a.length; k += 2) { mm += a[k]; pp += a[k + 1]; m.push(mm); p.push(pp / 100); }
+      d = { date: j.date, y: a[0] / 100, m, p };
+    }
+  }
+  Intra.c[c] = { d, at: Date.now() };
+  return d;
+}
+// 走勢圖：09:00～13:30，虛線是昨收；高於昨收紅、低於綠
+function intradaySvg(d) {
+  if (!d || !d.p.length) return '';
+  const W = 340, H = 150, T = 270, lo = Math.min(d.y, ...d.p), hi = Math.max(d.y, ...d.p), pad = (hi - lo || d.y * 0.01) * 0.08;
+  const y0 = lo - pad, y1 = hi + pad, X = m => (Math.max(0, Math.min(T, m)) / T * W).toFixed(1), Y = v => ((y1 - v) / (y1 - y0) * H).toFixed(1);
+  const pts = d.p.map((v, k) => `${X(d.m[k])},${Y(v)}`).join(' '), last = d.p[d.p.length - 1];
+  const col = last > d.y ? 'var(--up)' : last < d.y ? 'var(--down)' : 'var(--muted)';
+  const lab = (v, yy) => `<text x="${W - 2}" y="${yy}" text-anchor="end">${px(v)}　${fmtPct(v / d.y - 1)}</text>`;
+  return `<svg class="intra" viewBox="0 0 ${W} ${H + 16}" role="img" aria-label="分時走勢">
+    <polygon points="${X(d.m[0])},${Y(d.y)} ${pts} ${X(d.m[d.m.length - 1])},${Y(d.y)}" fill="${col}" opacity=".12"/>
+    <line x1="0" x2="${W}" y1="${Y(d.y)}" y2="${Y(d.y)}" class="ref"/>
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round"/>
+    ${lab(hi, 11)}${lab(lo, H - 3)}
+    <text x="0" y="${H + 13}">09:00</text><text x="${X(120)}" y="${H + 13}" text-anchor="middle">11:00</text><text x="${W}" y="${H + 13}" text-anchor="end">13:30</text>
+  </svg>`;
+}
+async function fillIntraday(c) {
+  const el = () => document.querySelector(`#intra[data-code="${c}"]`);
+  let d = null, err = '';
+  try { d = await loadIntraday(c); } catch (e) { err = '讀不到分時走勢（Yahoo 或電腦上傳的資料暫時沒有回應）。'; }
+  if (!el()) return;   // 詳情已經關掉或換一檔
+  const today = ymd(new Date());
+  el().innerHTML = d && d.p.length ? `${intradaySvg(d)}<div class="muted small">分時走勢 ${d.date === today ? '' : d.date + '・'}資料：Yahoo${Native ? '' : '（電腦每 2 分鐘上傳）'}</div>`
+    : `<div class="muted small">${err || (Native ? '這檔今天還沒有分時資料。' : '電腦今天還沒上傳這檔的分時走勢（盤中電腦要開著）。')}</div>`;
+}
 // 振幅＝（最高－最低）÷ 昨收
 const amp = q => (q.h && q.l && q.y ? (q.h - q.l) / q.y : null);
 function openWatchDetail(c) {
@@ -1257,6 +1315,7 @@ function openWatchDetail(c) {
   }
   openSheet(`${nm(c)} ${c}`, `<div class="row between"><div><b class="big ${ud(q.chg)}">${px(q.price)}</b> <span class="${ud(q.chg)}">${q.chg != null ? fmtPct(q.chg) : ''}</span></div>
       <div class="muted small">${esc(when)}</div></div>
+    <div id="intra" data-code="${esc(c)}" class="muted small" style="margin-top:8px">讀取分時走勢…</div>
     <div class="grid3" style="margin-top:10px">
       ${cell('開盤', px(q.o), pc(q.o))}${cell('最高', px(q.h), pc(q.h))}${cell('最低', px(q.l), pc(q.l))}
       ${cell('昨收', px(q.y))}${cell('振幅', a != null ? fmtPct(a, 2).replace('+', '') : '—')}${cell('成交量', q.lots ? money(Math.round(q.lots)) + ' 張' : '—')}
@@ -1265,6 +1324,7 @@ function openWatchDetail(c) {
     <h4 style="margin:14px 0 4px">最近 ${rows.length} 個交易日</h4>
     <table class="tbl"><tr><th>日期</th><th class="num">收盤</th><th class="num">漲跌</th><th class="num">最低～最高</th><th class="num">振幅</th></tr>${rows.join('')}</table>
     <p class="muted small">振幅＝（最高－最低）÷ 昨收。</p>`, () => '');
+  fillIntraday(c);
 }
 function renderWatch() {
   const L = watchList(), sim = App.sim, mine = myState().hold, today = ymd(new Date());

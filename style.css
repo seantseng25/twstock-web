@@ -137,6 +137,9 @@ details[open].card > summary { margin-bottom: 8px; }
 .star { border: 0; background: none; padding: 0 4px; font-size: 17px; line-height: 1; color: var(--muted); }
 .star.on { color: var(--c3); }
 .tap { cursor: pointer; }
+svg.intra { display: block; width: 100%; height: auto; overflow: visible; }
+svg.intra text { font-size: 10px; fill: var(--muted); paint-order: stroke; stroke: var(--card); stroke-width: 3px; }
+svg.intra .ref { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
 /* 自選股詳情：今天最低～最高的區間，▲ 現價、｜ 開盤 */
 .rng { position: relative; height: 8px; margin: 18px 4px 6px; border-radius: 4px; background: linear-gradient(90deg, var(--down), var(--up)); opacity: .85; }
 .rng b { position: absolute; transform: translateX(-50%); }
