@@ -1191,11 +1191,12 @@ async function fetchWatchQuotes() {
 // 一檔自選股目前的報價：即時 → 網頁版電腦上傳 → 最近收盤（和前一個收盤比漲跌）
 function watchQuote(c) {
   const today = ymd(new Date());
-  const q = Watch.q[c];
+  const q = Watch.q[c], n = App.dates.length;
+  // 今天的正式收盤已經下載：用正式收盤（即時報價收盤後可能停在 13:30 以前）
+  if (App.dates[n - 1] === today && closeAt(n - 1, c)) { const p = closeAt(n - 1, c), y = n > 1 ? closeAt(n - 2, c) : null; return { price: p, chg: y ? p / y - 1 : null, date: today, final: true }; }
   if (Native && q && q.price && q.date === today) return Object.assign({ live: true }, q);
   const r = !Native && Rank.live && Rank.live.date === today && Rank.live.rows.find(x => x.code === c);
   if (r && r.price) return { price: r.price, chg: r.chg, lots: r.lots, live: true, time: Rank.live.time, pc: true };
-  const n = App.dates.length;
   for (let i = n - 1; i >= 0; i--) {
     const p = closeAt(i, c);
     if (p) { const y = i > 0 ? closeAt(i - 1, c) : null; return { price: p, chg: y ? p / y - 1 : null, date: App.dates[i] }; }
@@ -1205,9 +1206,10 @@ function watchQuote(c) {
 function renderWatch() {
   const L = watchList(), sim = App.sim, mine = myState().hold, today = ymd(new Date());
   let h = `<section class="card"><div class="row between"><b>自選股（${L.length}）</b>
+
     <div class="row"><button class="btn-sm" data-act="watchAdd">＋ 加入</button>${L.length ? '<button class="btn-sm ghost" data-act="watchShare">分享清單</button>' : ''}</div></div>`;
-  const live = L.map(w => watchQuote(w.code)).find(q => q.live);
-  h += `<div class="muted small" style="margin-top:6px">${live ? `即時報價 ${live.time || ''}${live.pc ? '・電腦每 2 分鐘上傳，約晚 2～5 分鐘' : (inSession() ? '・盤中每 20 秒更新' : '')}` :
+  const live = L.map(w => watchQuote(w.code)).find(q => q.live), fin = L.some(w => watchQuote(w.code).final);
+  h += `<div class="muted small" style="margin-top:6px">${fin ? `${today} 正式收盤` : live ?`即時報價 ${live.time || ''}${live.pc ? '・電腦每 2 分鐘上傳，約晚 2～5 分鐘' : (inSession() ? '・盤中每 20 秒更新' : '')}` :
     L.length ? `${App.dates[App.dates.length - 1]} 收盤${inSession() ? '・讀取即時報價中…' : ''}` : '在每日建議、排行、百萬模擬的股票旁邊按 ☆，或按「＋ 加入」用代號、名稱搜尋。'}</div></section>`;
   if (!L.length) return h;
   // 策略模擬帳戶的持股（同一檔可能在不同組各買一次，合起來算）、今天的買進建議
@@ -1222,7 +1224,7 @@ function renderWatch() {
     if (!w.est) continue;
     const q = watchQuote(w.code);
     if (w.at !== today) { delete w.est; fixed = true; }
-    else if (q.live && q.price) { w.px = q.price; delete w.est; fixed = true; }
+    else if ((q.live || q.final) && q.price) { w.px = q.price; delete w.est; fixed = true; }
   }
   if (fixed) saveMy();
   h += `<div class="list">${L.map(w => {
