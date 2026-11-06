@@ -501,7 +501,7 @@ function myHistory() {
 
 // ============================================================ 畫面
 const $ = sel => document.querySelector(sel);
-const TITLES = { suggest: '每日建議', sim: '百萬模擬', mine: '我的帳戶', settings: '設定' };
+const TITLES = { suggest: '每日建議', rank: '成交量排行', sim: '百萬模擬', mine: '我的帳戶', settings: '設定' };
 
 function setStatus(msg, frac) {
   const el = $('#status');
@@ -523,9 +523,10 @@ function render() {
   const last = App.dates[App.dates.length - 1];
   $('#dataInfo').textContent = last ? `資料 ${last}` : '尚無資料';
   App.charts = {};
-  const html = { suggest: renderSuggest, sim: renderSim, mine: renderMine, settings: renderSettings }[App.tab]();
+  const html = { suggest: renderSuggest, rank: renderRank, sim: renderSim, mine: renderMine, settings: renderSettings }[App.tab]();
   $('#main').innerHTML = html;
   drawCharts();
+  rankAuto();
 }
 
 const regimeClass = n => ({ '偏多': 'bull', '偏空': 'bear', '方向不明': 'flat' }[n] || 'na');
@@ -852,6 +853,124 @@ function stmtRow(r) {
     <div class="row between small muted"><span>${esc(t.note || '')}</span><button class="link" data-act="delTxn" data-id="${t.id}">刪除</button></div></div>`;
 }
 
+// ---------------------------------------------------------- 成交量排行
+// 即時：證交所即時報價（mis.twse.com.tw）沒有排行榜 API，所以把所有上市股票分批查一次再自己排序；
+//       這個網址不開放網頁跨站讀取，只有 Android App（原生連線）能用。
+// 收盤／本週：用已下載的每日收盤資料計算，網頁版也能用。
+const Rank = { mode: Native ? 'live' : 'day', by: 'vol', etf: true, live: null, loading: false, done: 0, total: 0, err: '', timer: null };
+const RANK_TOP = 30;
+const isEtf = c => c.startsWith('00');
+const posNum = s => { const x = parseFloat(s); return isFinite(x) && x > 0 ? x : null; };
+// 手機時間當台灣時間：週一到週五 08:55–13:35 視為盤中（自動每分鐘更新）
+const inSession = () => { const d = new Date(), w = d.getDay(), m = d.getHours() * 60 + d.getMinutes(); return w > 0 && w < 6 && m >= 535 && m <= 815; };
+
+async function fetchLiveRank() {
+  if (!Native || Rank.loading || !App.days.length) return;
+  const batches = []; let cur = [];
+  for (const c of Object.keys(App.days[App.days.length - 1].q)) {
+    cur.push(`tse_${c}.tw`);
+    if (cur.join('|').length > 1200) { batches.push(cur); cur = []; }   // 網址太長證交所會回「參數不足」
+  }
+  if (cur.length) batches.push(cur);
+  Object.assign(Rank, { loading: true, done: 0, total: batches.length, err: '', tried: Date.now() });
+  if (App.tab === 'rank') render();
+  const rows = []; let fail = 0, date = '', time = '';
+  async function one(b) {
+    try {
+      const j = JSON.parse(await httpGet('https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=' + encodeURIComponent(b.join('|'))));
+      for (const m of j.msgArray || []) {
+        const lots = parseFloat(m.v), y = posNum(m.y);
+        if (!isFinite(lots)) continue;
+        // z 是最新成交價；剛好沒有新成交時是 "-"，改用最後一筆成交或最佳買價
+        const p = posNum(m.z) ?? posNum(m.trade && m.trade.z) ?? posNum(String(m.b || '').split('_')[0]);
+        rows.push({ code: m.c, name: m.n, price: p, chg: p && y ? p / y - 1 : null, lots, value: p ? lots * 1000 * p : 0 });
+        if ((m.d || '') + (m.t || '') > date + time) { date = m.d || ''; time = m.t || ''; }
+      }
+    } catch (e) { fail++; }
+    Rank.done++;
+    if (App.tab === 'rank' && Rank.done % 3 === 0) render();
+  }
+  let i = 0;   // 原生連線最多同時 3 條
+  await Promise.all([0, 1, 2].map(async () => { while (i < batches.length) await one(batches[i++]); }));
+  Rank.loading = false;
+  if (rows.length) Rank.live = { rows, date: date ? `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}` : '', time, at: Date.now(), partial: fail > 0 };
+  if (!rows.length) Rank.err = '證交所即時報價沒有回應，請稍後再按「重新整理」。';
+  else if (fail) Rank.err = `有 ${fail} 批資料沒抓到，排行可能不完整。`;
+  if (App.tab === 'rank') render();
+}
+
+// 收盤排行：一天（end 那天）或一段期間（from..end）的成交量加總；漲跌和期間前一天比
+function closeRank(from, end) {
+  const i0 = App.dates.indexOf(from), i1 = App.dates.indexOf(end);
+  const prev = i0 > 0 ? App.days[i0 - 1].q : null, acc = {};
+  for (let i = i0; i <= i1; i++) {
+    for (const [c, q] of Object.entries(App.days[i].q)) {
+      const a = acc[c] || (acc[c] = { code: c, name: nm(c), lots: 0, value: 0, price: null });
+      a.lots += q[4] / 1000; a.value += q[4] * q[3]; if (q[3] > 0) a.price = q[3];
+    }
+  }
+  return Object.values(acc).map(a => Object.assign(a, { chg: prev && prev[a.code] && prev[a.code][3] > 0 && a.price ? a.price / prev[a.code][3] - 1 : null }));
+}
+// 最新收盤日所在那一週（週一起算）的第一個交易日
+function weekStart(d) {
+  const w = parseYmd(d).getDay(), mon = addDays(d, -((w + 6) % 7));
+  return App.dates.find(x => x >= mon && x <= d);
+}
+
+function renderRank() {
+  if (!App.days.length) return empty('還沒有收盤資料，請先到「每日建議」按「更新資料」。');
+  const last = App.dates[App.dates.length - 1], ws = weekStart(last);
+  const chip = (act, v, on, label) => `<button class="${on ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`;
+  let h = `<section class="card"><div class="chips">
+      ${Native ? chip('rankMode', 'live', Rank.mode === 'live', '即時') : ''}
+      ${chip('rankMode', 'day', Rank.mode === 'day', `收盤 ${last.slice(5)}`)}
+      ${chip('rankMode', 'week', Rank.mode === 'week', `本週 ${ws.slice(5)}～${last.slice(5)}`)}
+    </div><div class="chips">
+      ${chip('rankBy', 'vol', Rank.by === 'vol', '成交量')}${chip('rankBy', 'val', Rank.by === 'val', '成交值')}
+      ${chip('rankEtf', 1, Rank.etf, '含 ETF')}${chip('rankEtf', 0, !Rank.etf, '只看個股')}
+    </div>`;
+  let rows = null, note = '';
+  if (Rank.mode === 'live') {
+    const L = Rank.live;
+    if (Rank.loading) h += `<div class="small muted">讀取即時報價 ${Rank.done}/${Rank.total}…</div><div class="status"><div class="bar"><i style="width:${Math.round(Rank.done / (Rank.total || 1) * 100)}%"></i></div></div>`;
+    if (L) {
+      rows = L.rows;
+      const today = ymd(new Date());
+      note = L.date && L.date !== today ? `證交所最新報價是 ${L.date} ${L.time}（今天還沒開盤或休市）` :
+        `報價時間 ${L.time}${inSession() ? '・盤中每分鐘自動更新' : '・已收盤'}`;
+    }
+    h += `<div class="row between"><span class="muted small">${note || '上市股票（不含上櫃）・證交所報價約有 5 秒延遲'}</span>
+      <button class="btn-sm" data-act="rankRefresh" ${Rank.loading ? 'disabled' : ''}>重新整理</button></div>`;
+    if (Rank.err) h += `<div class="err">${esc(Rank.err)}</div>`;
+  } else {
+    rows = Rank.mode === 'day' ? closeRank(last, last) : closeRank(ws, last);
+    note = Rank.mode === 'day' ? `${last} 收盤・上市股票（不含上櫃）` : `${ws} 到 ${last} 累計・漲跌是本週以來`;
+    h += `<div class="muted small">${note}</div>`;
+    if (!Native) h += `<div class="muted small">即時排行只有 Android App 有（證交所即時報價不開放網頁讀取）。</div>`;
+  }
+  h += '</section>';
+  if (!rows) return h + (Rank.loading ? '' : empty('按「重新整理」讀取即時排行。'));
+  const key = Rank.by === 'vol' ? 'lots' : 'value';
+  const top = rows.filter(r => r[key] > 0 && (Rank.etf || !isEtf(r.code))).sort((a, b) => b[key] - a[key]).slice(0, RANK_TOP);
+  const hold = myState().hold;
+  h += `<section class="card"><table class="tbl"><tr><th></th><th>股票</th><th class="num">價格</th><th class="num">${Rank.by === 'vol' ? '張數' : '金額（億）'}</th></tr>
+    ${top.map((r, i) => `<tr><td class="muted">${i + 1}</td>
+      <td><b>${esc(r.name || nm(r.code))}</b>${hold[r.code] ? ' <span class="tag">持有</span>' : ''}<div class="code">${esc(r.code)}</div></td>
+      <td class="num">${px(r.price)}<div class="small ${ud(r.chg)}">${fmtPct(r.chg)}</div></td>
+      <td class="num">${Rank.by === 'vol' ? money(r.lots) : (r.value / 1e8).toFixed(1)}</td></tr>`).join('')}</table>
+    ${Rank.by === 'val' ? '<p class="muted small">成交值用成交量 × 價格估算。</p>' : ''}</section>`;
+  return h;
+}
+
+// 排行分頁開著、在盤中，就每分鐘重抓一次即時報價
+function rankAuto() {
+  const want = Native && App.tab === 'rank' && Rank.mode === 'live';
+  if (want && !Rank.timer) Rank.timer = setInterval(() => { if (inSession() && !document.hidden) fetchLiveRank(); }, 60000);
+  if (!want && Rank.timer) { clearInterval(Rank.timer); Rank.timer = null; }
+  // 失敗後不馬上重試（至少隔 1 分鐘），免得一直打證交所
+  if (want && !Rank.loading && Date.now() - (Rank.tried || 0) > 60000 && (!Rank.live || inSession())) fetchLiveRank();
+}
+
 // ---------------------------------------------------------- 設定
 function renderSettings() {
   const s = App.settings, f = App.my.fee, d = App.dates;
@@ -1107,6 +1226,10 @@ document.addEventListener('click', e => {
   const act = el.dataset.act, code = el.dataset.code, id = +el.dataset.id;
   switch (act) {
     case 'sync': syncData(); break;
+    case 'rankMode': Rank.mode = el.dataset.v; render(); break;
+    case 'rankBy': Rank.by = el.dataset.v; render(); break;
+    case 'rankEtf': Rank.etf = el.dataset.v === '1'; render(); break;
+    case 'rankRefresh': fetchLiveRank(); break;
     case 'older': if (App.dates.length) syncData({ from: addDays(App.dates[0], -92), to: addDays(App.dates[0], -1) }); break;
     case 'closeSheet': closeSheet(); break;
     case 'deposit': openCash('DEPOSIT'); break;
