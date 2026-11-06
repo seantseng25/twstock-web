@@ -96,7 +96,8 @@ const App = {
   settings: null, my: null, busy: false, charts: {}, sheet: null, stmtMonth: 'all',
 };
 const SETTINGS_DEFAULT = { startDate: null, capital: 1000000, exitDays: 1, reminder: { on: true, h: 17, m: 30 } };
-const MY_DEFAULT = { seq: 0, txns: [], plans: [], dismissed: [], fee: { discount: 1, minFee: 20, minFeeOdd: 1, dcaFee: 1 } };
+// watch：自選股 [{ code, at: 加入日期, px: 加入時價格 }]，放在 my.json 裡，備份會一起帶走
+const MY_DEFAULT = { seq: 0, txns: [], plans: [], dismissed: [], watch: [], fee: { discount: 1, minFee: 20, minFeeOdd: 1, dcaFee: 1 } };
 
 function loadJson(name, def) {
   try { const s = Store.read(name); if (s) return Object.assign(JSON.parse(JSON.stringify(def)), JSON.parse(s)); } catch (e) { /* 壞檔就用預設值 */ }
@@ -613,7 +614,7 @@ function myHistory() {
 
 // ============================================================ 畫面
 const $ = sel => document.querySelector(sel);
-const TITLES = { suggest: '每日建議', rank: '成交量排行', sim: '百萬模擬', mine: '我的帳戶', settings: '設定' };
+const TITLES = { suggest: '每日建議', rank: '看盤', sim: '百萬模擬', mine: '我的帳戶', settings: '設定' };
 
 function setStatus(msg, frac) {
   const el = $('#status');
@@ -684,7 +685,7 @@ function renderSuggest() {
   h += `<h3 class="sec">買進建議 <span class="count">${entry.buys.length}</span></h3>`;
   h += entry.buys.length ? `<div class="list">${entry.buys.map(b => `
     <div class="item">
-      <div class="row between">${stockLine(b.code, tag(b.g))}<button class="btn-sm" data-act="quickBuy" data-code="${b.code}">記錄買進</button></div>
+      <div class="row between">${stockLine(b.code, tag(b.g) + starBtn(b.code))}<button class="btn-sm" data-act="quickBuy" data-code="${b.code}">記錄買進</button></div>
       <div class="small">收盤 <b>${px(b.close)}</b>・停損參考 <b>${px(b.stop)}</b></div>
       <div class="muted small">${esc(b.why)}</div>
     </div>`).join('')}</div>` : empty(regName === '偏空' ? '大盤偏空，核心組照規則不買；其他組也沒有新名單。' : '今天沒有買進訊號。');
@@ -726,7 +727,7 @@ function groupHoldings(g) {
   const rows = G.pos.slice().sort((a, b) => (a.entryDate < b.entryDate ? -1 : 1)).map(p => {
     const cur = App.days[t].q[p.code]?.[3] ?? p.last, r = App.sim.posRet(p, cur);
     const days = Math.round((today - parseYmd(p.entryDate)) / 86400000);
-    return `<tr><td>${stockLine(p.code)}<div class="muted small">${p.entryDate}・${days} 天</div></td>
+    return `<tr><td>${stockLine(p.code, starBtn(p.code))}<div class="muted small">${p.entryDate}・${days} 天</div></td>
       <td class="num">${px(p.entryPrice)}<div class="muted small">停損 ${px(p.stop)}</div></td>
       <td class="num">${px(cur)}<div class="${ud(r)}">${fmtPct(r)}</div></td></tr>`;
   }).join('');
@@ -816,12 +817,13 @@ function renderSim() {
   const t = App.days.length - 1;
   const holds = sim.acct.hold.map(x => {
     const value = x.shares * x.last, r = value / x.cost - 1;
-    return `<tr><td>${stockLine(x.code)}<div class="muted small">${GROUP_LABEL[x.group]}・${x.date}</div></td>
-      <td class="num">${x.shares.toLocaleString()}<div class="muted small">成本 ${money(x.cost)}</div></td>
-      <td class="num">${money(value)}<div class="${ud(r)}">${fmtPct(r)}</div></td></tr>`;
+    return `<tr><td>${stockLine(x.code, starBtn(x.code))}<div class="muted small">${GROUP_LABEL[x.group]}・${x.date} 買進</div></td>
+      <td class="num">${px(x.cost / x.shares)}<div class="muted small">現價 ${px(x.last)}</div></td>
+      <td class="num">${money(value)}<div class="${ud(r)}">${fmtPct(r)}</div><div class="muted small">${x.shares.toLocaleString()} 股</div></td></tr>`;
   }).join('');
   h += `<section class="card"><h3 class="sec0">目前持股（${sim.acct.hold.length}）</h3>
-    ${holds ? `<table class="tbl"><thead><tr><th>股票</th><th class="num">股數</th><th class="num">市值/損益</th></tr></thead><tbody>${holds}</tbody></table>` : empty('目前空手')}</section>`;
+    ${holds ? `<table class="tbl"><thead><tr><th>股票</th><th class="num">買入均價</th><th class="num">市值/損益</th></tr></thead><tbody>${holds}</tbody></table>
+    <p class="muted small">買入均價含手續費。按 ☆ 加入自選股，在「看盤」分頁就能一起看即時價格。</p>` : empty('目前空手')}</section>`;
 
   const trades = sim.acct.trades.slice(-100).reverse().map(x => {
     const isDiv = x.side === '股利', buy = x.side === '買進';
@@ -978,7 +980,7 @@ function stmtRow(r) {
 //       這個網址不開放網頁跨站讀取，只有 Android App（原生連線）能直接查；
 //       網頁版改讀電腦盤中每 2 分鐘上傳的排行（live_rank.ps1）。
 // 收盤／本週：用已下載的每日收盤資料計算，網頁版也能用。
-const Rank = { mode: 'live', by: 'vol', etf: true, mkt: 'all', live: null, loading: false, done: 0, total: 0, err: '', timer: null };
+const Rank = { view: 'watch', mode: 'live', by: 'vol', etf: true, mkt: 'all', live: null, loading: false, done: 0, total: 0, err: '', timer: null };
 const RANK_TOP = 30;
 const isEtf = c => c.startsWith('00');
 const posNum = s => { const x = parseFloat(s); return isFinite(x) && x > 0 ? x : null; };
@@ -1073,8 +1075,14 @@ function weekStart(d) {
   return App.dates.find(x => x >= mon && x <= d);
 }
 
+// 看盤分頁：自選股／成交量排行
 function renderRank() {
   if (!App.days.length) return empty('還沒有收盤資料，請先到「每日建議」按「更新資料」。');
+  const seg = `<div class="chips seg">${[['watch', '自選股'], ['rank', '成交量排行']].map(([v, l]) =>
+    `<button class="${Rank.view === v ? 'on' : ''}" data-act="rankView" data-v="${v}">${l}</button>`).join('')}</div>`;
+  return seg + (Rank.view === 'watch' ? renderWatch() : renderRankList());
+}
+function renderRankList() {
   const last = App.dates[App.dates.length - 1], ws = weekStart(last);
   const chip = (act, v, on, label) => `<button class="${on ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`;
   if (!HAS_LIVE && Rank.mode === 'live') Rank.mode = 'day';
@@ -1121,16 +1129,160 @@ function renderRank() {
   const hold = myState().hold;
   h += `<section class="card"><table class="tbl"><tr><th></th><th>股票</th><th class="num">價格</th><th class="num">${Rank.by === 'vol' ? '張數' : '金額（億）'}</th></tr>
     ${top.map((r, i) => `<tr><td class="muted">${i + 1}</td>
-      <td><b>${esc(r.name || nm(r.code))}</b>${hold[r.code] ? ' <span class="tag">持有</span>' : ''}<div class="code">${esc(r.code)}${r.otc ? '・上櫃' : ''}</div></td>
+      <td><b>${esc(r.name || nm(r.code))}</b>${hold[r.code] ? ' <span class="tag">持有</span>' : ''}<div class="code">${esc(r.code)}${r.otc ? '・上櫃' : ''} ${starBtn(r.code)}</div></td>
       <td class="num">${px(r.price)}<div class="small ${ud(r.chg)}">${fmtPct(r.chg)}</div></td>
       <td class="num">${Rank.by === 'vol' ? money(r.lots) : (r.value / 1e8).toFixed(1)}</td></tr>`).join('')}</table>
     ${Rank.by === 'val' ? `<p class="muted small">${Rank.mode === 'live' ? '成交值用成交量 × 現價估算。' : '上市成交值用成交量 × 收盤價估算，上櫃是櫃買中心公布的成交金額。'}</p>` : ''}</section>`;
   return h;
 }
 
+// ---------------------------------------------------------- 自選股
+// 報價：Android 直接查證交所即時報價（只查自選的幾檔，盤中每 20 秒）；網頁版用電腦上傳的 rank.json（全部股票都有）；
+// 沒有即時報價就用最近收盤
+const Watch = { q: {}, at: 0, busy: false, timer: null, date: '', time: '' };
+const watchList = () => App.my.watch || (App.my.watch = []);
+const inWatch = c => watchList().some(w => w.code === c);
+const starBtn = c => `<button type="button" class="star ${inWatch(c) ? 'on' : ''}" data-act="watchToggle" data-code="${esc(c)}" aria-label="自選股">${inWatch(c) ? '★' : '☆'}</button>`;
+const isOtcCode = c => !App.names[c] && !!App.otcNames[c];
+function watchAdd(codes) {
+  const L = watchList(), last = App.dates[App.dates.length - 1], added = [];
+  for (const c of codes) {
+    if (!c || L.some(w => w.code === c)) continue;
+    const live = Watch.q[c]?.date === ymd(new Date()) ? Watch.q[c].price : null;
+    // 還沒有即時報價就先記最近收盤（est），當天第一次拿到即時報價時換掉
+    L.push(Object.assign({ code: c, at: ymd(new Date()), px: live || (last && priceOn(c, last)?.price) || null }, live ? {} : { est: true })); added.push(c);
+  }
+  saveMy();
+  if (added.length && Native) fetchWatchQuotes();
+  return added;
+}
+function watchToggle(c) {
+  const L = watchList(), i = L.findIndex(w => w.code === c);
+  if (i >= 0) { L.splice(i, 1); saveMy(); toast(`已從自選股移除 ${nm(c)}`); }
+  else { watchAdd([c]); toast(`已加入自選股：${nm(c)}`); }
+  render();
+}
+async function fetchWatchQuotes() {
+  const L = watchList();
+  if (!L.length) return;
+  if (Watch.busy) { Watch.again = true; return; }   // 抓的途中又加了股票：抓完再抓一次
+  if (!Native) {   // 網頁版：rank.json 裡有全部股票的即時報價
+    Watch.at = Date.now();
+    if (liveRankUrl() && !Rank.loading && Date.now() - (Rank.tried || 0) > 55000) await fetchWebLiveRank();
+    return;
+  }
+  Watch.busy = true; Watch.at = Date.now();   // 先記時間：失敗也要隔一段時間才重試
+  const keys = L.map(w => `${isOtcCode(w.code) ? 'otc' : 'tse'}_${w.code}.tw`), batches = [];
+  for (let i = 0; i < keys.length; i += 40) batches.push(keys.slice(i, i + 40));
+  try {
+    for (const b of batches) {
+      const j = JSON.parse(await httpGet('https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=' + encodeURIComponent(b.join('|'))));
+      for (const m of j.msgArray || []) {
+        const y = posNum(m.y), p = posNum(m.z) ?? posNum(m.trade && m.trade.z) ?? posNum(String(m.b || '').split('_')[0]);
+        Watch.q[m.c] = { price: p, chg: p && y ? p / y - 1 : null, lots: parseFloat(m.v) || 0, h: posNum(m.h), l: posNum(m.l), date: d8(m.d), time: m.t || '' };
+        if ((m.d || '') + (m.t || '') > Watch.date + Watch.time) { Watch.date = m.d || ''; Watch.time = m.t || ''; }
+      }
+    }
+  } catch (e) { /* 抓不到就先顯示收盤價 */ }
+  Watch.busy = false;
+  if (Watch.again) { Watch.again = false; return fetchWatchQuotes(); }
+  if (App.tab === 'rank' && Rank.view === 'watch' && !App.sheet) render();
+}
+// 一檔自選股目前的報價：即時 → 網頁版電腦上傳 → 最近收盤（和前一個收盤比漲跌）
+function watchQuote(c) {
+  const today = ymd(new Date());
+  const q = Watch.q[c];
+  if (Native && q && q.price && q.date === today) return Object.assign({ live: true }, q);
+  const r = !Native && Rank.live && Rank.live.date === today && Rank.live.rows.find(x => x.code === c);
+  if (r && r.price) return { price: r.price, chg: r.chg, lots: r.lots, live: true, time: Rank.live.time, pc: true };
+  const n = App.dates.length;
+  for (let i = n - 1; i >= 0; i--) {
+    const p = closeAt(i, c);
+    if (p) { const y = i > 0 ? closeAt(i - 1, c) : null; return { price: p, chg: y ? p / y - 1 : null, date: App.dates[i] }; }
+  }
+  return { price: null };
+}
+function renderWatch() {
+  const L = watchList(), sim = App.sim, mine = myState().hold, today = ymd(new Date());
+  let h = `<section class="card"><div class="row between"><b>自選股（${L.length}）</b>
+    <div class="row"><button class="btn-sm" data-act="watchAdd">＋ 加入</button>${L.length ? '<button class="btn-sm ghost" data-act="watchShare">分享清單</button>' : ''}</div></div>`;
+  const live = L.map(w => watchQuote(w.code)).find(q => q.live);
+  h += `<div class="muted small" style="margin-top:6px">${live ? `即時報價 ${live.time || ''}${live.pc ? '・電腦每 2 分鐘上傳，約晚 2～5 分鐘' : (inSession() ? '・盤中每 20 秒更新' : '')}` :
+    L.length ? `${App.dates[App.dates.length - 1]} 收盤${inSession() ? '・讀取即時報價中…' : ''}` : '在每日建議、排行、百萬模擬的股票旁邊按 ☆，或按「＋ 加入」用代號、名稱搜尋。'}</div></section>`;
+  if (!L.length) return h;
+  // 策略模擬帳戶的持股（同一檔可能在不同組各買一次，合起來算）、今天的買進建議
+  const simHold = {};
+  for (const x of (sim && sim.acct.hold) || []) {
+    const s = simHold[x.code] || (simHold[x.code] = { shares: 0, cost: 0, date: x.date, groups: [] });
+    s.shares += x.shares; s.cost += x.cost; if (x.date < s.date) s.date = x.date; s.groups.push(GROUP_LABEL[x.group] || x.group);
+  }
+  const buys = {}; for (const b of (sim && sim.last.buys) || []) buys[b.code] = b;
+  let fixed = false;
+  for (const w of L) {
+    if (!w.est) continue;
+    const q = watchQuote(w.code);
+    if (w.at !== today) { delete w.est; fixed = true; }
+    else if (q.live && q.price) { w.px = q.price; delete w.est; fixed = true; }
+  }
+  if (fixed) saveMy();
+  h += `<div class="list">${L.map(w => {
+    const c = w.code, q = watchQuote(c), lines = [];
+    if (w.px && q.price) { const r = q.price / w.px - 1; lines.push(`${w.at} 加入時 ${px(w.px)}，之後 <b class="${ud(r)}">${fmtPct(r)}</b>`); }
+    const s = simHold[c];
+    if (s) {
+      const avg = s.cost / s.shares, r = q.price ? q.price / avg - 1 : null;
+      lines.push(`<span class="tag tag-core">策略持有</span> ${s.date} 買進・均價 <b>${px(avg)}</b>（${s.shares.toLocaleString()} 股・${esc(s.groups.join('、'))}）${r != null ? `　<b class="${ud(r)}">${fmtPct(r)}</b>` : ''}`);
+    }
+    const b = buys[c];
+    if (b) lines.push(`<span class="tag tag-pead">今日建議買進</span> ${GROUP_LABEL[b.g]}・收盤 ${px(b.close)}・停損 ${px(b.stop)}`);
+    const m = mine[c];
+    if (m) { const avg = m.cost / m.shares, r = q.price ? q.price / avg - 1 : null; lines.push(`<span class="tag">我的持股</span> ${m.shares.toLocaleString()} 股・均價 ${px(avg)}${r != null ? `　<b class="${ud(r)}">${fmtPct(r)}</b>` : ''}`); }
+    return `<div class="item">
+      <div class="row between"><div class="stk"><b>${esc(nm(c))}</b><span class="code">${esc(c)}${isOtcCode(c) ? '・上櫃' : ''}</span></div>
+        <div class="right"><b class="big ${ud(q.chg)}">${px(q.price)}</b><div class="small ${ud(q.chg)}">${q.chg != null ? fmtPct(q.chg) : ''}${q.date && q.date !== today ? `<span class="muted">・${q.date.slice(5)} 收盤</span>` : ''}</div></div></div>
+      ${lines.map(x => `<div class="small" style="margin-top:4px">${x}</div>`).join('')}
+      <div class="row between" style="margin-top:6px"><button class="btn-sm" data-act="quickBuy" data-code="${esc(c)}">記錄買進</button>
+        <button class="link" data-act="watchToggle" data-code="${esc(c)}">移除</button></div></div>`;
+  }).join('')}</div>
+  <p class="muted small">策略持有＝百萬模擬帳戶目前的持股；均價含手續費。自選股只存在這支手機（備份會一起帶走），按「分享清單」可以傳給朋友。</p>`;
+  return h;
+}
+function openWatchAdd() {
+  openSheet('加入自選股', `${stockField('', '代號或名稱，例如 台積電')}
+    <div class="muted small" id="fName"></div>
+    <p class="muted small">也可以一次貼上多檔代號（朋友分享的清單），用逗號或空白分開，例如 2330,0050,6488。</p>`, () => {
+    const v = fv('fCode');
+    if (!v) throw new Error('請輸入股票代號或名稱');
+    const parts = v.split(/[,，、\s]+/).filter(Boolean), idx = stockIndex();
+    const codes = parts.length > 1 ? parts.map(p => p.toUpperCase()) : [codeVal()];
+    const bad = codes.filter(c => !idx.has(c));
+    if (bad.length === codes.length) throw new Error(`找不到「${bad.join('、')}」，請從清單選一檔股票`);
+    const added = watchAdd(codes.filter(c => idx.has(c)));
+    return (added.length ? `已加入 ${added.map(nm).join('、')}` : '都已經在自選股裡了') + (bad.length ? `（找不到：${bad.join('、')}）` : '');
+  }, () => { const c = codeVal(); $('#fName').textContent = c && stockIndex().has(c) ? `${c} ${stockName(c)}` : ''; });
+}
+function openWatchShare() {
+  const L = watchList(), codes = L.map(w => w.code).join(',');
+  openSheet('分享自選股', `<p class="small">把下面這行複製給朋友，朋友在「看盤 → 自選股 → ＋ 加入」貼上就能加入同樣的 ${L.length} 檔：</p>
+    <textarea id="fShare" rows="3" readonly>${esc(codes)}</textarea>
+    <div class="muted small">${esc(L.map(w => nm(w.code)).join('、'))}</div>`, () => {
+    try { navigator.clipboard.writeText(codes); } catch (e) { /* 不支援就讓使用者自己複製 */ }
+    return '已複製，可以貼給朋友';
+  });
+  const t = $('#fShare'); if (t) { t.focus(); t.select(); }
+}
+// 自選股開著、在盤中：Android 每 20 秒、網頁版每分鐘更新報價
+function watchAuto() {
+  const want = App.tab === 'rank' && Rank.view === 'watch' && watchList().length > 0;
+  if (want && !Watch.timer) Watch.timer = setInterval(() => { if (inSession() && !document.hidden && !App.sheet) fetchWatchQuotes(); }, Native ? 20000 : 60000);
+  if (!want && Watch.timer) { clearInterval(Watch.timer); Watch.timer = null; }
+  if (want && !Watch.busy && Date.now() - Watch.at > 55000 && (inSession() || !Watch.at)) fetchWatchQuotes();
+}
+
 // 排行分頁開著、在盤中，就每分鐘重抓一次即時報價
 function rankAuto() {
-  const want = HAS_LIVE && App.tab === 'rank' && Rank.mode === 'live';
+  watchAuto();
+  const want = HAS_LIVE && App.tab === 'rank' && Rank.view === 'rank' && Rank.mode === 'live';
   if (want && !Rank.timer) Rank.timer = setInterval(() => { if (inSession() && !document.hidden) fetchLiveRank(); }, 60000);
   if (!want && Rank.timer) { clearInterval(Rank.timer); Rank.timer = null; }
   // 失敗後不馬上重試（至少隔 1 分鐘），免得一直打證交所
@@ -1526,6 +1678,10 @@ document.addEventListener('click', e => {
   const act = el.dataset.act, code = el.dataset.code, id = +el.dataset.id;
   switch (act) {
     case 'sync': syncData(); break;
+    case 'rankView': Rank.view = el.dataset.v; render(); break;
+    case 'watchToggle': watchToggle(code); break;
+    case 'watchAdd': openWatchAdd(); break;
+    case 'watchShare': openWatchShare(); break;
     case 'rankMode': Rank.mode = el.dataset.v; render(); break;
     case 'rankBy': Rank.by = el.dataset.v; render(); break;
     case 'rankEtf': Rank.etf = el.dataset.v === '1'; render(); break;
