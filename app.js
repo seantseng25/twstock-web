@@ -115,9 +115,14 @@ function listByPrefix(prefix) {
 }
 const readCsv = (prefix, d) => Store.read(prefix + d + '.csv') ?? Store.asset('seed/' + prefix + d + '.csv');
 
+// Android 和網頁版都只用最近 DATA_DAYS 個交易日（和網站 publish.ps1 放的一樣多），兩邊可選的模擬起始日才會相同。
+// 更舊的檔案刪掉省空間（APK 內建的刪不掉，直接不讀）；更長的歷史看長期回測（電腦用 2004 年起的資料算）
+const DATA_DAYS = 300;
 function loadData() {
   App.names = {};
-  App.dates = listByPrefix('d_');
+  const all = listByPrefix('d_');
+  App.dates = all.slice(-DATA_DAYS);
+  for (const d of all.slice(0, -DATA_DAYS)) for (const p of ['d_', 'o_']) if (Store.read(p + d + '.csv') != null) Store.del(p + d + '.csv');
   App.days = App.dates.map(d => parseDayCsv(d, readCsv('d_', d), App.names));
   App.funds = listByPrefix('f_').map(d => Object.assign(parseFundCsv(readCsv('f_', d)), { date: d }));
   loadDivs();
@@ -1388,7 +1393,7 @@ function renderSettings() {
     <label class="field"><span>本金</span><input id="setCap" type="number" inputmode="numeric" value="${s.capital}"></label>
     <label class="field"><span>核心組出場</span><select id="setExit">
       ${[[1, '穩健：跌破 20 日線就賣'], [2, '中庸：連 2 天才賣'], [3, '積極：連 3 天才賣']].map(([v, l]) => `<option value="${v}" ${s.exitDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <p class="muted small">起始日前要有 60 個交易日的歷史才能判斷大盤；要更早的起始日，請先補抓歷史資料。</p>
+    <p class="muted small">起始日前要有 60 個交易日的歷史才能判斷大盤。App 和網頁版都保留最近 ${DATA_DAYS} 個交易日，可以選的起始日一樣；更長期的表現請看百萬模擬上方的長期回測（2004 年起）。</p>
     <button class="btn wide" data-act="saveSim">套用並重新模擬</button></section>
 
   <section class="card"><h3 class="sec0">我的帳戶手續費</h3>
@@ -1420,8 +1425,7 @@ function renderSettings() {
   <section class="card"><h3 class="sec0">資料</h3>
     <p class="small">收盤資料 ${d.length} 天（${d[0] || '—'} ～ ${d[d.length - 1] || '—'}）<br>基本面快照 ${App.funds.length} 份（最新 ${App.funds[App.funds.length - 1]?.date || '—'}）</p>
     <button class="btn wide" data-act="sync" ${App.busy ? 'disabled' : ''}>立即更新</button>
-    <button class="btn wide ghost" data-act="older" ${App.busy ? 'disabled' : ''}>補抓更早 3 個月的歷史</button>
-    <p class="muted small">資料來源：臺灣證券交易所公開資料（只有上市股票）。證交所有流量限制，每天約 3 秒抓一次，補抓 3 個月大約 3 分鐘。${IS_WEB
+    <p class="muted small">資料來源：臺灣證券交易所、櫃買中心公開資料，保留最近 ${DATA_DAYS} 個交易日（App 和網頁版一樣）。${IS_WEB
       ? '網頁版的營收、淨值比、殖利率由電腦每天收盤後上傳（證交所不允許網頁直接讀取這些資料），收盤價則手機也會自己下載。' : ''}</p></section>
 
   <section class="card"><h3 class="sec0">備份</h3>
@@ -1689,7 +1693,6 @@ document.addEventListener('click', e => {
     case 'rankEtf': Rank.etf = el.dataset.v === '1'; render(); break;
     case 'rankMkt': Rank.mkt = el.dataset.v; render(); break;
     case 'rankRefresh': fetchLiveRank(); break;
-    case 'older': if (App.dates.length) syncData({ from: addDays(App.dates[0], -92), to: addDays(App.dates[0], -1) }); break;
     case 'closeSheet': closeSheet(); break;
     case 'deposit': openCash('DEPOSIT'); break;
     case 'withdraw': openCash('WITHDRAW'); break;
