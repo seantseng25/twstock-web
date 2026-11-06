@@ -127,6 +127,9 @@ details[open].card > summary { margin-bottom: 8px; }
 .chips button { border: 1px solid var(--line); background: var(--bg); border-radius: 16px; padding: 4px 12px; font-size: 13px; }
 .chips button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .chips { flex-wrap: wrap; }
+.sug { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; margin: 4px 0; overflow: hidden; }
+.sug button { border: 0; border-top: 1px solid var(--line); background: var(--bg); text-align: left; padding: 9px 12px; font-size: 15px; }
+.sug button:first-child { border-top: 0; }
 .calc { background: var(--bg); border-radius: 10px; padding: 10px; margin-top: 10px; font-size: 14px; min-height: 40px; }
 .err { color: var(--up); font-size: 13px; min-height: 18px; margin-top: 8px; }
 

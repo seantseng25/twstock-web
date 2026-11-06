@@ -1238,16 +1238,63 @@ function openSheet(title, body, onSubmit, onInput) {
   $('#sheetBody').innerHTML = `<form id="sheetForm">${body}<div class="err" id="sheetErr"></div><button class="btn wide" type="submit">確定</button></form>`;
   $('#sheet').classList.remove('hidden');
   App.sheet = { onSubmit, onInput };
+  stockIdx = null; wireStockSearch();
   if (onInput) onInput();
 }
 function closeSheet() { $('#sheet').classList.add('hidden'); App.sheet = null; }
 window.onAndroidBack = () => { if (App.sheet) { closeSheet(); return true; } return false; };
 const fv = id => document.getElementById(id).value.trim();
 
-function stockDatalist() {
-  const last = App.days[App.days.length - 1];
-  const codes = last ? Object.keys(last.q) : [];
-  return `<datalist id="stockList">${codes.map(c => `<option value="${c}">${esc(nm(c))}</option>`).join('')}</datalist>`;
+// 股票搜尋：代號或中文名稱都可以，輸入框下方列出符合的股票（上市＋上櫃），點一下帶入代號
+let stockIdx = null;
+function stockIndex() {
+  if (stockIdx) return stockIdx;
+  const m = new Map(), lastO = Object.keys(App.otc || {}).sort().pop(), last = App.days[App.days.length - 1];
+  if (lastO) for (const [c, o] of Object.entries(App.otc[lastO])) m.set(c, { n: o.name, otc: true });
+  if (last) for (const c of Object.keys(last.q)) m.set(c, { n: nm(c), otc: false });
+  return (stockIdx = m);
+}
+const stockName = c => (stockIndex().get(c) || {}).n || nm(c);
+function stockSearch(q, max = 8) {
+  q = q.trim().toUpperCase();
+  if (!q) return [];
+  const hits = [];
+  for (const [c, x] of stockIndex()) {
+    const n = x.n.toUpperCase(), s = c.startsWith(q) ? 0 : n.startsWith(q) ? 1 : n.includes(q) ? 2 : -1;
+    if (s >= 0) hits.push({ s, c, ...x });
+  }
+  return hits.sort((a, b) => a.s - b.s || a.c.length - b.c.length || a.c.localeCompare(b.c)).slice(0, max);
+}
+// 輸入的是名稱時換成代號（完全相同的名稱，或只剩一檔符合）
+function codeVal() {
+  const v = fv('fCode'), idx = stockIndex();
+  if (!v || idx.has(v)) return v;
+  for (const [c, x] of idx) if (x.n === v) return c;
+  const h = stockSearch(v, 2);
+  return h.length === 1 ? h[0].c : v;
+}
+const stockField = (value, ph) => `<label class="field"><span>股票</span><input id="fCode" autocomplete="off" value="${esc(value || '')}" placeholder="${ph || '代號或名稱，例如 台積電'}" required></label><div id="fSug" class="sug hidden"></div>`;
+function wireStockSearch() {
+  const inp = $('#fCode'), box = $('#fSug');
+  if (!inp || !box) return;
+  const show = () => {
+    const v = inp.value.trim(), hits = stockIndex().has(v) ? [] : stockSearch(v);
+    box.innerHTML = hits.map(h => `<button type="button" data-c="${h.c}"><b>${esc(h.n)}</b> <span class="code">${h.c}${h.otc ? '・上櫃' : ''}</span></button>`).join('');
+    box.classList.toggle('hidden', !hits.length);
+  };
+  inp.addEventListener('input', show);
+  inp.addEventListener('focus', show);
+  box.addEventListener('click', e => {
+    const b = e.target.closest('button[data-c]');
+    if (!b) return;
+    inp.value = b.dataset.c; box.classList.add('hidden');
+    if (App.sheet && App.sheet.onInput) App.sheet.onInput();
+  });
+}
+// 上櫃股票的收盤價（只有最近 OTC_DAYS 天）
+function otcPriceOn(code, date) {
+  for (const d of Object.keys(App.otc || {}).sort().reverse()) if (d <= date && App.otc[d][code]?.close > 0) return { price: App.otc[d][code].close, date: d };
+  return null;
 }
 const defaultDate = () => App.dates[App.dates.length - 1] || ymd(new Date());
 
@@ -1267,7 +1314,7 @@ function openTrade(side, code, price) {
   const st = myState();
   const holdOpts = Object.keys(st.hold).map(c => `<option value="${c}" ${c === code ? 'selected' : ''}>${c} ${esc(nm(c))}（${st.hold[c].shares.toLocaleString()} 股）</option>`).join('');
   const codeField = side === 'BUY'
-    ? `<label class="field"><span>股票代號</span><input id="fCode" list="stockList" inputmode="numeric" value="${code || ''}" required></label>${stockDatalist()}`
+    ? stockField(code)
     : `<label class="field"><span>股票</span><select id="fCode">${holdOpts}</select></label>`;
   if (side === 'SELL' && !holdOpts) { toast('目前沒有持股可以賣'); return; }
   let lastKey = '', first = true;
@@ -1278,19 +1325,20 @@ function openTrade(side, code, price) {
     <label class="field"><span>股數</span><input id="fSh" type="number" inputmode="numeric" placeholder="1 張 = 1000 股" required></label>
     <div class="chips"><button type="button" data-sh="1000">1 張</button><button type="button" data-sh="100">+100 股</button><button type="button" data-sh="all">${side === 'SELL' ? '全部' : '清除'}</button></div>
     <div class="calc" id="fCalc"></div>`, () => {
-    const c = fv('fCode'), p = num(fv('fPx')), sh = Math.floor(num(fv('fSh')) || 0);
-    if (!c) throw new Error('請輸入股票代號');
+    const c = codeVal(), p = num(fv('fPx')), sh = Math.floor(num(fv('fSh')) || 0);
+    if (!c) throw new Error('請輸入股票代號或名稱');
+    if (side === 'BUY' && !stockIndex().has(c)) throw new Error(`找不到「${c}」，請從清單選一檔股票`);
     if (!p || p <= 0 || sh <= 0) throw new Error('請輸入成交價和股數');
     const amount = p * sh, fee = myFee(amount, sh), tax = side === 'SELL' ? myTax(amount, c) : 0;
     addTxn({ date: fv('fDate'), type: side, code: c, shares: sh, price: p, amount, fee, tax, note: '' });
-    return `${TXN_LABEL[side]} ${nm(c)} ${sh.toLocaleString()} 股`;
+    return `${TXN_LABEL[side]} ${stockName(c)} ${sh.toLocaleString()} 股`;
   }, () => {
-    const c = fv('fCode'), date = fv('fDate');
-    $('#fName').textContent = c ? (App.names[c] ? nm(c) : '（不在上市資料裡，請自己輸入成交價）') : '';
+    const c = codeVal(), date = fv('fDate'), known = stockIndex().has(c);
+    $('#fName').textContent = !c ? '' : known ? `${c} ${stockName(c)}` : side === 'BUY' ? '（找不到這檔股票，請從清單選擇）' : '';
     const key = c + '|' + date;
-    if (key !== lastKey && c && date) {   // 換了股票或日期才自動帶入當天收盤價（第一次開啟時保留傳進來的價格）
+    if (key !== lastKey && known && date) {   // 換了股票或日期才自動帶入當天收盤價（第一次開啟時保留傳進來的價格）
       lastKey = key;
-      const p = priceOn(c, date);
+      const p = priceOn(c, date) || otcPriceOn(c, date);
       if (p && !(first && price)) $('#fPx').value = p.price;
       if (side === 'SELL' && st.hold[c]) $('#fSh').value = st.hold[c].shares;
       first = false;
@@ -1307,7 +1355,7 @@ function openTrade(side, code, price) {
   });
   document.querySelectorAll('.chips button').forEach(b => b.addEventListener('click', () => {
     const el = $('#fSh'), cur = Math.floor(num(el.value) || 0);
-    if (b.dataset.sh === 'all') el.value = side === 'SELL' ? (st.hold[fv('fCode')]?.shares || '') : '';
+    if (b.dataset.sh === 'all') el.value = side === 'SELL' ? (st.hold[codeVal()]?.shares || '') : '';
     else el.value = b.dataset.sh === '1000' ? cur + 1000 : cur + 100;
     App.sheet.onInput();
   }));
@@ -1318,7 +1366,7 @@ function openDividend(pre) {
   pre = pre || {};
   const exDate = pre.date || defaultDate();
   openSheet('記錄股利', `
-    <label class="field"><span>股票代號</span><input id="fCode" list="stockList" inputmode="numeric" value="${pre.code || ''}" required></label>${stockDatalist()}
+    ${stockField(pre.code)}
     <div class="muted small" id="fName"></div>
     <label class="field"><span>除權息日</span><input id="fEx" type="date" value="${exDate}" required></label>
     <label class="field"><span>入帳日期</span><input id="fDate" type="date" value="${pre.date || defaultDate()}" required></label>
@@ -1329,15 +1377,15 @@ function openDividend(pre) {
     <label class="field"><span>匯費</span><input id="fRemit" type="number" inputmode="numeric" value="10"></label>
     <div class="calc" id="fCalc"></div>
     <p class="muted small">二代健保：單次股利 2 萬元以上扣 2.11%（留空自動算）。配股不足 1 股的部分不計。</p>`, () => {
-    const c = fv('fCode'), sh = Math.floor(num(fv('fSh')) || 0), x = calc();
-    if (!c) throw new Error('請輸入股票代號');
+    const c = codeVal(), sh = Math.floor(num(fv('fSh')) || 0), x = calc();
+    if (!c) throw new Error('請輸入股票代號或名稱');
     if (!x.gross && !x.add) throw new Error('請輸入持股和每股股利');
     addTxn({ date: fv('fDate'), type: 'DIV', code: c, shares: x.add, price: num(fv('fCash')) || 0, amount: x.gross, fee: x.nhi + x.remit, tax: 0,
       divKey: pre.divKey || null, note: `除權息日 ${fv('fEx')}・持股 ${sh.toLocaleString()} 股` });
-    return `已記錄 ${nm(c)} 股利 ${money(x.gross - x.nhi - x.remit)} 元` + (x.add ? `、配股 ${x.add} 股` : '');
+    return `已記錄 ${stockName(c)} 股利 ${money(x.gross - x.nhi - x.remit)} 元` + (x.add ? `、配股 ${x.add} 股` : '');
   }, () => {
-    const c = fv('fCode');
-    $('#fName').textContent = c ? nm(c) : '';
+    const c = codeVal();
+    $('#fName').textContent = c ? `${c} ${stockName(c)}` : '';
     if (!pre.shares && c && fv('fEx') && !fv('fSh')) {   // 手動輸入時自動帶入除權息前一天的持股
       const s = sharesBefore(App.my.txns, c, fv('fEx'));
       if (s > 0) $('#fSh').value = s;
@@ -1355,22 +1403,23 @@ function openDividend(pre) {
 
 function openDCA() {
   openSheet('新增定期定額', `
-    <label class="field"><span>股票代號</span><input id="fCode" list="stockList" inputmode="numeric" placeholder="例如 0050" required></label>${stockDatalist()}
+    ${stockField('', '代號或名稱，例如 0050、元大台灣50')}
     <div class="muted small" id="fName"></div>
     <label class="field"><span>每次金額</span><input id="fAmt" type="number" inputmode="numeric" value="3000" required></label>
     <label class="field"><span>每月扣款日</span><input id="fDays" value="6" placeholder="例如 6,16,26"></label>
     <label class="field"><span>開始日期</span><input id="fStart" type="date" value="${ymd(new Date())}" required></label>
     <p class="muted small">扣款日可以填多個，用逗號分開（1～28）。開始日期可以設在過去，會自動補上已經發生的扣款。</p>`, () => {
-    const code = fv('fCode'), amount = num(fv('fAmt'));
+    const code = codeVal(), amount = num(fv('fAmt'));
     const days = [...new Set(fv('fDays').split(/[,，、\s]+/).map(Number).filter(x => x >= 1 && x <= 28))].sort((a, b) => a - b);
-    if (!code) throw new Error('請輸入股票代號');
+    if (!code) throw new Error('請輸入股票代號或名稱');
+    if (!stockIndex().has(code)) throw new Error(`找不到「${code}」，請從清單選一檔股票`);
     if (!amount || amount < 100) throw new Error('每次金額至少 100 元');
     if (!days.length) throw new Error('請輸入扣款日（1～28）');
     App.my.plans.push({ id: ++App.my.seq, code, amount, days, start: fv('fStart'), active: true, lastRun: null });
     saveMy();
     const n = runDCA();
-    return `已新增 ${nm(code)} 定期定額` + (n ? `，補上 ${n} 次扣款` : '');
-  }, () => { const c = fv('fCode'); $('#fName').textContent = c ? nm(c) : ''; });
+    return `已新增 ${stockName(code)} 定期定額` + (n ? `，補上 ${n} 次扣款` : '');
+  }, () => { const c = codeVal(); $('#fName').textContent = c ? `${c} ${stockName(c)}` : ''; });
 }
 
 // ============================================================ 事件
