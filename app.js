@@ -558,20 +558,22 @@ function myState() {
   let st;
   try { st = replay(App.my.txns); } catch (e) { st = { cash: 0, net: 0, hold: {}, realized: 0, fees: 0, taxes: 0, divIncome: 0, lastPx: {}, rows: [], error: e.message }; }
   const lastDate = App.dates[App.dates.length - 1];
-  let mv = 0, mvPrev = 0, cost = 0;
+  let mv = 0, mvPrev = 0, cost = 0, live = '';
   const list = [];
   for (const code in st.hold) {
     const h = st.hold[code];
-    const p = lastDate && priceOn(code, lastDate);
-    const price = p ? p.price : st.lastPx[code];
-    const i = App.dates.length - 2, prev = i >= 0 ? closeAt(i, code) : null;
+    // 盤中有即時報價就用即時價，今日損益和昨收比
+    const q = watchQuote(code), p = lastDate && priceOn(code, lastDate);
+    const price = q.live && q.price ? q.price : p ? p.price : st.lastPx[code];
+    const i = App.dates.length - 2, prev = q.live && q.y ? q.y : i >= 0 ? closeAt(i, code) : null;
+    if (q.live && q.price && (q.time || '') >= live) live = q.time || live || ' ';
     const value = h.shares * price;
     mv += value; cost += h.cost; mvPrev += h.shares * (prev || price);
     list.push({ code, shares: h.shares, avg: h.cost / h.shares, cost: h.cost, price, value, pnl: value - h.cost });
   }
   list.sort((a, b) => b.value - a.value);
   const total = st.cash + mv;
-  return Object.assign(st, { mv, total, list, unrealized: mv - cost, pnl: total - st.net, dayChg: mv - mvPrev });
+  return Object.assign(st, { mv, total, list, unrealized: mv - cost, pnl: total - st.net, dayChg: mv - mvPrev, live });
 }
 
 function addTxn(t) {
@@ -819,7 +821,17 @@ function renderSim() {
   const sim = App.sim;
   const long = renderLongBacktest();
   if (!sim || !sim.perf.length) return long + empty('還沒有足夠的資料。');
-  const s = perfSummary(sim.perf), cap = sim.cfg.capital, a = sim.last.acct, pnl = a.total - cap;
+  const s = perfSummary(sim.perf), cap = sim.cfg.capital;
+  // 盤中：持股改用即時報價估算（買賣仍照收盤後的訊號，隔天才成交）
+  let live = '', stock = 0;
+  const lastPx = {};
+  for (const x of sim.acct.hold) {
+    const q = watchQuote(x.code), on = q.live && q.price;
+    lastPx[x.code] = on ? q.price : x.last;
+    if (on && (q.time || '') >= live) live = q.time || live || ' ';
+    stock += x.shares * lastPx[x.code];
+  }
+  const a = live ? { cash: sim.last.acct.cash, stock, total: sim.last.acct.cash + stock } : sim.last.acct, pnl = a.total - cap;
   App.charts.sim = {
     labels: sim.perf.map(x => x.date), pct: true,
     series: [
@@ -840,7 +852,7 @@ function renderSim() {
       <div><div class="muted small">股利收入</div><b class="${ud(sim.acct.divs)}">${money(sim.acct.divs)}</b></div>
       <div><div class="muted small">起始日</div><b>${s.start}</b></div>
     </div>
-    <p class="muted small">共 ${s.n} 個交易日。每天收盤後照核心、價值、PEAD 三組訊號自動買賣，隔天成交：整張用開盤價、零股用收盤價＋0.1%，手續費和證交稅照扣，錢不夠就買不起。
+    <p class="muted small">${liveNote(live)}共 ${s.n} 個交易日。每天收盤後照核心、價值、PEAD 三組訊號自動買賣，隔天成交：整張用開盤價、零股用收盤價＋0.1%，手續費和證交稅照扣，錢不夠就買不起。
       除權息日自動領股利（扣二代健保和匯費）。起始日可在「設定」修改。</p>
   </section>
   <section class="card">${chartBlock('sim')}</section>
@@ -852,9 +864,9 @@ function renderSim() {
 
   const t = App.days.length - 1;
   const holds = sim.acct.hold.map(x => {
-    const value = x.shares * x.last, r = value / x.cost - 1;
+    const value = x.shares * lastPx[x.code], r = value / x.cost - 1;
     return `<tr><td>${stockLine(x.code, starBtn(x.code))}<div class="muted small">${GROUP_LABEL[x.group]}・${x.date} 買進</div></td>
-      <td class="num">${px(x.cost / x.shares)}<div class="muted small">現價 ${px(x.last)}</div></td>
+      <td class="num">${px(x.cost / x.shares)}<div class="muted small">現價 ${px(lastPx[x.code])}</div></td>
       <td class="num">${money(value)}<div class="${ud(r)}">${fmtPct(r)}</div><div class="muted small">${x.shares.toLocaleString()} 股</div></td></tr>`;
   }).join('');
   h += `<section class="card"><h3 class="sec0">目前持股（${sim.acct.hold.length}）</h3>
@@ -900,7 +912,7 @@ function renderMine() {
       <div><div class="muted small">已實現</div><b class="${ud(st.realized)}">${signMoney(st.realized)}</b></div>
       <div><div class="muted small">股利收入</div><b class="${ud(st.divIncome)}">${signMoney(st.divIncome)}</b></div>
     </div>
-    <p class="muted small">手續費和證交稅累計 ${money(st.fees + st.taxes)} 元。總損益已包含股利。</p>
+    <p class="muted small">${liveNote(st.live)}手續費和證交稅累計 ${money(st.fees + st.taxes)} 元。總損益已包含股利。</p>
     <div class="actions">
       <button class="act" data-act="deposit"><i>＋</i>入金</button>
       <button class="act" data-act="withdraw"><i>－</i>出金</button>
@@ -1039,7 +1051,7 @@ async function fetchWebLiveRank() {
       date: j.date, time: j.time, at: Date.now(), uploaded: j.at, fromPc: true };
   } catch (e) { Rank.err = '讀不到電腦上傳的即時排行（電腦可能沒開，或今天還沒上傳）。'; }
   Rank.loading = false;
-  if (App.tab === 'rank') render();
+  if (App.tab === 'rank' || (quoteTab() && !App.sheet)) render();
 }
 
 async function fetchLiveRank() {
@@ -1198,8 +1210,19 @@ function watchToggle(c) {
   else { watchAdd([c]); toast(`已加入自選股：${nm(c)}`); }
   render();
 }
+// 要查即時報價的股票：自選股＋我的帳戶持股＋百萬模擬持股
+function quoteCodes() {
+  const s = new Set(watchList().map(w => w.code));
+  for (const c in replaySafe().hold) s.add(c);
+  for (const x of (App.sim && App.sim.acct.hold) || []) s.add(x.code);
+  return [...s];
+}
+function replaySafe() { try { return replay(App.my.txns); } catch (e) { return { hold: {} }; } }
+// 看盤報價更新後，正在看的分頁有用到就重畫
+const quoteTab = () => (App.tab === 'rank' && Rank.view === 'watch') || App.tab === 'mine' || App.tab === 'sim';
+const liveNote = t => t ? `<b>盤中即時估算 ${esc(t.trim())}</b>${Native ? '' : '（電腦每 2 分鐘上傳，約晚 2～5 分鐘）'}，收盤資料下載後改用正式收盤。` : '';
 async function fetchWatchQuotes() {
-  const L = watchList();
+  const L = quoteCodes().map(code => ({ code }));
   if (!L.length) return;
   if (Watch.busy) { Watch.again = true; return; }   // 抓的途中又加了股票：抓完再抓一次
   if (!Native) {   // 網頁版：rank.json 裡有全部股票的即時報價
@@ -1222,7 +1245,7 @@ async function fetchWatchQuotes() {
   } catch (e) { /* 抓不到就先顯示收盤價 */ }
   Watch.busy = false;
   if (Watch.again) { Watch.again = false; return fetchWatchQuotes(); }
-  if (App.tab === 'rank' && Rank.view === 'watch' && !App.sheet) render();
+  if (quoteTab() && !App.sheet) render();
 }
 // 某天的開高低和成交張數：上市收盤檔有；上櫃收盤檔只有收盤，沒有開高低
 function dayBar(i, c) {
@@ -1556,9 +1579,11 @@ function openWatchShare() {
   });
   const t = $('#fShare'); if (t) { t.focus(); t.select(); }
 }
-// 自選股開著、在盤中：Android 每 20 秒、網頁版每分鐘更新報價
+// 自選股、我的帳戶、百萬模擬開著、在盤中：Android 每 20 秒、網頁版每分鐘更新報價
 function watchAuto() {
-  const want = App.tab === 'rank' && Rank.view === 'watch' && watchList().length > 0;
+  const want = App.tab === 'rank' ? Rank.view === 'watch' && watchList().length > 0
+    : App.tab === 'mine' ? Object.keys(replaySafe().hold).length > 0
+    : App.tab === 'sim' ? !!(App.sim && App.sim.acct.hold.length) : false;
   if (want && !Watch.timer) Watch.timer = setInterval(() => { if (inSession() && !document.hidden && !App.sheet) fetchWatchQuotes(); }, Native ? 20000 : 60000);
   if (!want && Watch.timer) { clearInterval(Watch.timer); Watch.timer = null; }
   if (want && !Watch.busy && Date.now() - Watch.at > 55000 && (inSession() || !Watch.at)) fetchWatchQuotes();
