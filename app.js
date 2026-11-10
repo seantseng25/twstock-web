@@ -95,7 +95,8 @@ const App = {
   divs: {}, divList: [], divNext: [], otc: {}, otcNames: {},
   settings: null, my: null, busy: false, charts: {}, sheet: null, stmtMonth: 'all',
 };
-const SETTINGS_DEFAULT = { startDate: null, capital: 1000000, exitDays: 1, reminder: { on: true, h: 17, m: 30 } };
+// preset：百萬模擬帳戶的策略（engine.js 的 STRATEGY_PRESETS）；sizing：每檔金額固定或跟著總資產變
+const SETTINGS_DEFAULT = { startDate: null, capital: 1000000, exitDays: 1, preset: 'core', sizing: 'fixed', reminder: { on: true, h: 17, m: 30 } };
 // watch：自選股 [{ code, at: 加入日期, px: 加入時價格 }]，放在 my.json 裡，備份會一起帶走
 const MY_DEFAULT = { seq: 0, txns: [], plans: [], dismissed: [], watch: [], fee: { discount: 1, minFee: 20, minFeeOdd: 1, dcaFee: 1 } };
 
@@ -257,7 +258,8 @@ function computeSim() {
   let start = 60;
   if (App.settings.startDate) { const i = App.dates.findIndex(d => d >= App.settings.startDate); if (i >= 0) start = Math.max(60, i); }
   start = Math.min(start, n - 1);
-  App.sim = runStrategy(App.days, fundAt, start, { capital: App.settings.capital, exitDays: App.settings.exitDays }, App.names, App.divs);
+  const s = App.settings;
+  App.sim = runStrategy(App.days, fundAt, start, Object.assign({ capital: s.capital, exitDays: s.exitDays, sizing: s.sizing }, presetCfg(s.preset)), App.names, App.divs);
 }
 
 // ---------------------------------------------------------- 下載（臺灣證券交易所）
@@ -780,7 +782,9 @@ function groupHoldings(g) {
 function renderLongBacktest() {
   const bt = App.bt;
   if (!bt || !bt.runs || !bt.runs.length) return '';
-  const k = Math.min(App.btRun || 0, bt.runs.length - 1), R = bt.runs[k], S = R.series, i0 = S.index[0];
+  // 沒手動切換就顯示設定裡選的策略
+  const mine = Math.max(0, bt.runs.findIndex(r => r.key === App.settings.preset));
+  const k = Math.min(App.btRun ?? mine, bt.runs.length - 1), R = bt.runs[k], S = R.series, i0 = S.index[0];
   const E5 = R.etf && S.etf ? R.etf : null;   // 舊版 backtest.json 沒有 0050 比較
   App.charts.long = { labels: S.dates, pct: true, series: [
     { name: '模擬帳戶', color: 'var(--accent)', data: S.acct.map(v => v / R.capital - 1) },
@@ -810,6 +814,10 @@ function renderLongBacktest() {
       <div><div class="muted small">三組合計</div><b class="${ud(R.combRet)}">${fmtPct(R.combRet, 0)}</b></div>
     </div>${vs}</section>
   <section class="card">${chartBlock('long')}</section>
+  ${bt.runs.length > 1 ? `<section class="card"><h3 class="sec0">各策略比較（100 萬）</h3><table class="tbl"><thead><tr><th>帳戶策略</th><th class="num">最後金額</th><th class="num">年化/最大回落</th></tr></thead><tbody>${
+    bt.runs.map((r, i) => `<tr class="tap" data-act="btPick" data-i="${i}"${i === k ? ' style="font-weight:700"' : ''}><td>${esc(r.label)}${r.key === App.settings.preset ? ' <span class="tag">目前設定</span>' : ''}</td>
+      <td class="num">${money(r.final)}</td><td class="num"><span class="${ud(r.cagr)}">${fmtPct(r.cagr)}</span><div class="muted small">${(r.acctMdd * 100).toFixed(1)}%</div></td></tr>`).join('')}</tbody></table>
+    <p class="muted small">點一列看該策略的走勢和逐年報酬；要改模擬帳戶用的策略，到「設定 → 百萬模擬」。</p></section>` : ''}
   ${crows ? `<section class="card"><h3 class="sec0">股災和大多頭時的表現</h3><table class="tbl"><thead><tr><th>期間</th><th class="num">帳戶</th>${E5 ? '<th class="num">0050</th>' : ''}<th class="num">大盤</th></tr></thead><tbody>${crows}</tbody></table></section>` : ''}
   <details class="card"><summary>逐年報酬</summary><table class="tbl"><thead><tr><th>年</th><th class="num">帳戶</th>${E5 ? '<th class="num">0050</th>' : ''}<th class="num">大盤</th><th class="num">核心</th><th class="num">價值</th><th class="num">PEAD</th></tr></thead><tbody>${yrows}</tbody></table>
     <p class="muted small">核心組、PEAD 組要有月營收資料（2010 年起）才會選股。</p></details>
@@ -817,6 +825,12 @@ function renderLongBacktest() {
   <h3 class="sec">近期模擬（手機計算）</h3>`;
 }
 
+const presetLabel = () => (STRATEGY_PRESETS.find(p => p.key === App.settings.preset) || STRATEGY_PRESETS[0]).label;
+function simRule() {
+  const c = presetCfg(App.settings.preset);
+  if (c.picks === false) return c.parkMA ? `不買個股，加權指數站上 ${c.parkMA} 日線 2% 就買進 0050、跌破 2% 就賣回現金，` : '不買個股，現金買進 0050 一直抱著，';
+  return `每天收盤後照${(c.acctGroups || GROUPS).map(g => GROUP_LABEL[g]).join('、')}的訊號自動買賣（其他組只算紙上績效），`;
+}
 function renderSim() {
   const sim = App.sim;
   const long = renderLongBacktest();
@@ -852,7 +866,7 @@ function renderSim() {
       <div><div class="muted small">股利收入</div><b class="${ud(sim.acct.divs)}">${money(sim.acct.divs)}</b></div>
       <div><div class="muted small">起始日</div><b>${s.start}</b></div>
     </div>
-    <p class="muted small">${liveNote(live)}共 ${s.n} 個交易日。每天收盤後照核心、價值、PEAD 三組訊號自動買賣，隔天成交：整張用開盤價、零股用收盤價＋0.1%，手續費和證交稅照扣，錢不夠就買不起。
+    <p class="muted small">${liveNote(live)}共 ${s.n} 個交易日。帳戶策略「${esc(presetLabel())}」：${simRule()}隔天成交：整張用開盤價、零股用收盤價＋0.1%，手續費和證交稅照扣，錢不夠就買不起。
       除權息日自動領股利（扣二代健保和匯費）。起始日可在「設定」修改。</p>
   </section>
   <section class="card">${chartBlock('sim')}</section>
@@ -1694,9 +1708,13 @@ function renderSettings() {
   return `<section class="card"><h3 class="sec0">百萬模擬</h3>
     <label class="field"><span>起始日</span><select id="setStart">${starts.map(x => `<option ${x === cur ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
     <label class="field"><span>本金</span><input id="setCap" type="number" inputmode="numeric" value="${s.capital}"></label>
+    <label class="field"><span>帳戶策略</span><select id="setPreset">${STRATEGY_PRESETS.map(p => `<option value="${p.key}" ${p.key === s.preset ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}</select></label>
+    <label class="field"><span>每檔金額</span><select id="setSizing">
+      ${[['fixed', '固定：本金 ÷ 30'], ['equity', '複利：總資產 ÷ 30']].map(([v, l]) => `<option value="${v}" ${s.sizing === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <label class="field"><span>核心組出場</span><select id="setExit">
       ${[[1, '穩健：跌破 20 日線就賣'], [2, '中庸：連 2 天才賣'], [3, '積極：連 3 天才賣']].map(([v, l]) => `<option value="${v}" ${s.exitDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <p class="muted small">起始日前要有 60 個交易日的歷史才能判斷大盤。App 和網頁版都保留最近 ${DATA_DAYS} 個交易日，可以選的起始日一樣；更長期的表現請看百萬模擬上方的長期回測（2010 年起）。</p>
+    <p class="muted small">帳戶策略只決定模擬帳戶照哪幾組的訊號下單；三組每天照樣選股、算紙上績效。各選項 2010 年起的長期表現可以在百萬模擬上方的長期回測切換比較。
+      起始日前要有 60 個交易日的歷史才能判斷大盤。App 和網頁版都保留最近 ${DATA_DAYS} 個交易日，可以選的起始日一樣；更長期的表現請看百萬模擬上方的長期回測（2010 年起）。</p>
     <button class="btn wide" data-act="saveSim">套用並重新模擬</button></section>
 
   <section class="card"><h3 class="sec0">我的帳戶手續費</h3>
@@ -1993,6 +2011,7 @@ document.addEventListener('click', e => {
     case 'watchShare': openWatchShare(); break;
     case 'watchDetail': case 'stockDetail': openStockDetail(code); break;
     case 'detailTab': detailTab(el.dataset.v); break;
+    case 'btPick': App.btRun = +el.dataset.i; render(); window.scrollTo(0, 0); break;
     case 'detailWatch': watchToggle(code); el.textContent = inWatch(code) ? '★ 已在自選股' : '☆ 加入自選股'; break;
     case 'rankMode': Rank.mode = el.dataset.v; render(); break;
     case 'rankBy': Rank.by = el.dataset.v; render(); break;
@@ -2029,6 +2048,8 @@ document.addEventListener('click', e => {
       App.settings.startDate = fv('setStart');
       App.settings.capital = Math.max(10000, num(fv('setCap')) || 1000000);
       App.settings.exitDays = +fv('setExit');
+      App.settings.preset = fv('setPreset'); App.settings.sizing = fv('setSizing');
+      App.btRun = null;   // 長期回測跟著切到新選的策略
       saveSettings(); computeSim(); toast('已重新模擬'); App.tab = 'sim'; render(); break;
     }
     case 'saveFee': {

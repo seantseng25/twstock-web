@@ -3,7 +3,7 @@
 // 資料格式：每天 { date, index, q: {code: [open, high, low, close, volume, pe]}, trust: {code: 投信買賣超} | null }
 
 const GROUPS = ['Core', 'Value', 'Pead'];
-const GROUP_LABEL = { Core: '核心組', Value: '價值組', Pead: 'PEAD 組' };
+const GROUP_LABEL = { Core: '核心組', Value: '價值組', Pead: 'PEAD 組', Park: '0050' };   // Park：停泊／一直抱的 ETF 部位
 
 const DEFAULT_CFG = {
   coreCap: 20, coreMaxBuy: 5, coreTopPct: 0.08, topIndustries: 10,
@@ -18,7 +18,19 @@ const DEFAULT_CFG = {
   parkMA: 0,            // 停泊條件：加權指數在 N 日均線之上才停泊，跌破就賣回現金（0＝一直停泊）
   parkBand: 0,          // 均線上下的緩衝（0.02＝站上均線 2% 才買、跌破 2% 才賣），減少來回進出
   etfTax: 0.001,        // ETF 證交稅 0.1%
+  acctGroups: null,     // 帳戶照哪幾組的訊號下單，例如 ['Core']（null＝三組都買）；沒買的組照樣產生訊號和紙上績效
 };
+
+// 模擬帳戶的策略選項（App 設定和長期回測共用）；第一個是預設
+const STRATEGY_PRESETS = [
+  { key: 'core', label: '只買核心組', cfg: { acctGroups: ['Core'] } },
+  { key: 'all', label: '三組都買', cfg: {} },
+  { key: 'valcore', label: '價值組＋核心組', cfg: { acctGroups: ['Value', 'Core'] } },
+  { key: 'value', label: '只買價值組', cfg: { acctGroups: ['Value'] } },
+  { key: 'etf60', label: '不買個股：0050 照 60 日線進出', cfg: { picks: false, park: '0050', parkMA: 60, parkBand: 0.02 } },
+  { key: 'etf', label: '不買個股：0050 一直抱', cfg: { picks: false, park: '0050' } },
+];
+const presetCfg = key => (STRATEGY_PRESETS.find(p => p.key === key) || STRATEGY_PRESETS[0]).cfg;
 
 function num(s) {
   if (s === undefined || s === null) return null;
@@ -104,6 +116,7 @@ function addSplits(days, divs) {
 // divs：{ 除權息日: { code: { prev, ref, cash, stock } } }，prev/ref 是除權息前收盤與參考價，cash 每股現金股利，stock 每股配股。
 function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
   const cfg = Object.assign({}, DEFAULT_CFG, cfgIn || {});
+  const acctGroups = cfg.acctGroups || GROUPS;
   const G = {};
   for (const k of GROUPS) {
     G[k] = { key: k, w: k === 'Core' ? 1 / cfg.coreCap : 1 / 30, navG: 1, navN: 1, pos: [], pendBuy: [], pendSell: [], closed: [], closedN: 0, closedSum: 0 };
@@ -332,12 +345,12 @@ function runStrategy(days, fundAt, startIdx, cfgIn, names, divs) {
     if (ph) {
       let need = 0;
       if (!acct.parkOn) need = Infinity;
-      else if (cfg.picks) { for (const gk of GROUPS) need += G[gk].pendBuy.length * budget; need -= acct.cash; }
+      else if (cfg.picks) { for (const gk of acctGroups) need += G[gk].pendBuy.length * budget; need -= acct.cash; }
       if (need > 0) sell(ph, need === Infinity ? ph.shares : Math.min(ph.shares, Math.ceil(need / pq[0] / 1000) * 1000), pq, 'Park',
         need === Infinity ? '大盤跌破均線，停泊資金換回現金' : '賣出停泊 ETF 換現金買個股');
     }
     if (cfg.picks) {
-      for (const gk of GROUPS) for (const b of G[gk].pendBuy) { const q = Q(t, b.code); if (q && q[0] > 0) buy(gk, b.code, q, budget, b.why); }
+      for (const gk of acctGroups) for (const b of G[gk].pendBuy) { const q = Q(t, b.code); if (q && q[0] > 0) buy(gk, b.code, q, budget, b.why); }
     }
     if (pq && pq[0] > 0 && acct.parkOn) {
       const spare = acct.cash - acct.lastTotal * 0.005;   // 留一點現金付手續費
